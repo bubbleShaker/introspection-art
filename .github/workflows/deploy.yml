@@ -1,0 +1,55 @@
+# master に入ったものを https://bubbleshaker.github.io/introspection-art/ にする。
+# 入る前の検査は check.yml。ここは出す係。
+name: deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# 既定は読むだけ。ビルドは npm ci でよそのコードを走らせる場所なので、
+# 公開のための書き込み権限はそこに置かず deploy ジョブにだけ渡す
+permissions:
+  contents: read
+
+# 公開は一本ずつ。走っているものは出し切り、待たせるのは最後の master だけにする
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 既定では GITHUB_TOKEN が .git/config に残り、依存パッケージの
+          # postinstall から読める。公開は deploy ジョブの仕事なので持たせない
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      # deploy-pages が Pages に名乗るための短命なトークン。長命の秘密を持ち回らずに済む
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

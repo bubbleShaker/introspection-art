@@ -1,0 +1,19 @@
+{
+  "name": "introspection-art",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "test": "vitest run --passWithNoTests",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "oxlint": "^1.78.0",
+    "typescript": "~6.0.3",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  }
+}
