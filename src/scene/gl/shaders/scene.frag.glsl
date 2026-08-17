@@ -34,7 +34,10 @@ out vec4 fragColor;
 
 const vec3 SKY_TOP     = vec3(0.016, 0.024, 0.059);  // #04060f
 const vec3 SKY_HORIZON = vec3(0.094, 0.141, 0.247);  // #18243f
-const vec3 WATER_DEEP  = vec3(0.008, 0.012, 0.035);
+/** 手前の水。視線が立って底の暗さがそのまま出る */
+const vec3 WATER_DEEP  = vec3(0.006, 0.010, 0.030);
+/** 水平線寄りの水。水の層を斜めに長く見るので、わずかに明るい */
+const vec3 WATER_FAR   = vec3(0.020, 0.032, 0.062);
 const vec3 MOON_TINT   = vec3(0.87, 0.92, 1.00);
 
 // ---- 目の高さと視野 --------------------------------------------------------
@@ -59,7 +62,18 @@ const float MAX_DISTANCE = 900.0;
 /** 月の見かけの大きさ（半径・ラジアン） */
 const float MOON_ANGLE = 0.030;
 
-vec3 skyColor(vec3 dir) {
+/**
+ * ある方向を見たときの空の色。
+ *
+ * blur は「その方向がどれだけ暴れているか」（ラジアン）。空を直接見る時は 0、
+ * 水面の反射として引く時は、その 1 ピクセルに収まりきらなかった細かい波の
+ * ぶんが入る。月は blur のぶんだけ広がり、広がったぶんだけ薄くなる。
+ *
+ * これが遠景のちらつきを止めている。細かい波を消すだけだと遠くの水面は
+ * ただの鏡になってしまうが、消した波の暴れを光の広がりへ振り替えると、
+ * 「遠くの月の道はぼんやり滲む」という見え方になる。
+ */
+vec3 skyColor(vec3 dir, float blur) {
   // 水平線際が明るく、天頂へ向かって沈む。0.42 乗にすると、明るさが
   // 水平線のすぐ上に集まって空が高く見える
   float up = clamp(dir.y, 0.0, 1.0);
@@ -67,17 +81,19 @@ vec3 skyColor(vec3 dir) {
 
   // 月。中域が厚いほどわずかに膨らみ、暈も強くなる
   float ang = acos(clamp(dot(dir, uMoonDir), -1.0, 1.0));
-  float radius = MOON_ANGLE * (1.0 + uMid * 0.22);
+  float radius = MOON_ANGLE * (1.0 + uMid * 0.22) + blur;
+  // 広がったぶんは薄める。同じ光の量が広い面積へ散る
+  float spread = MOON_ANGLE / radius;
 
   // 芯。1 をはるかに超える値を入れる。下のトーンマップで白へ張りつき、
   // 縁だけが滲みへなだらかに落ちる（そのまま 1.0 にすると灰色の円盤になる）
   float disc = 1.0 - smoothstep(radius * 0.86, radius, ang);
   // すぐ外側の滲み
-  float bleed = exp(-ang * 26.0) * 2.4;
+  float bleed = exp(-ang / (0.038 + blur)) * 2.4 * spread;
   // 遠くまで届く暈。空全体を底上げするので、反射にもそのまま乗る
   float halo = exp(-ang * 2.2) * (0.13 + uMid * 0.17);
 
-  col += MOON_TINT * (disc * 14.0 + bleed + halo);
+  col += MOON_TINT * (disc * 14.0 * spread * spread + bleed + halo);
 
   // 水平線際の霞。空と水の境目を溶かして、切り取ったような硬さを消す
   float haze = exp(-max(dir.y, 0.0) * 22.0) * (0.05 + uMid * 0.05);
@@ -88,37 +104,58 @@ vec3 skyColor(vec3 dir) {
 
 // ---- 水 --------------------------------------------------------------------
 
+/** 重ねる波の数。多いほど水面が細かく砕ける */
+const int WAVE_COUNT = 9;
+
+/** 消した細かい波を、光の広がりへどれだけ振り替えるか */
+const float BLUR_GAIN = 0.24;
+
 /**
- * 波の傾き（法線）。
+ * 波の傾き（法線）と、そこで捨てた細かさ（blur）。
  *
- * 高さ場そのものは要らない。要るのはその勾配なので、sin を足した式を
- * 解析的に微分した cos の和で直接求める。
+ * 高さ場そのものは要らない。要るのはその勾配なので、波の式を解析的に
+ * 微分した形で直接求める。
+ *
+ * 波は正弦波そのものではなく、((sin+1)/2)^2 で尖らせている。正弦波のままだと
+ * 山と谷が同じ形になり、水よりゼリーに見える。二乗すると山が細く立ち、
+ * 谷が広く平らになって、水面らしい非対称さが出る。
  *
  * dist で細かい波を落としているのが要点。遠方は 1 ピクセルに何十もの波が
- * 入るので、そのまま描くと水平線際が白くちらつく。遠いほど高周波から
- * 順に消して、遠景を静かな鏡へ寄せる。
+ * 入るので、そのまま描くと水平線際が白くちらつく。ただ消すだけだと遠くが
+ * ただの鏡になるので、消したぶんは blur として持ち帰り、月の像を広げるのに使う。
  */
-vec3 waterNormal(vec2 p, float dist) {
-  float lod = 1.0 / (1.0 + dist * 0.10);
-  float amp = 0.075 * (0.45 + uLow * 1.30) * uMotion;
-  float freq = 0.80;
+vec3 waterSurface(vec2 p, float dist, out float blur) {
+  float lod = 1.0 / (1.0 + dist * 0.16);
+  // 振幅は月の道の広がりを決める。波が立つほど月を返す面が増え、
+  // 光の道が手前へ向かって三角形に開く
+  float amp = 0.150 * (0.45 + uLow * 1.30) * uMotion;
+  float freq = 0.75;
   float speed = 0.90;
   float ang = 0.0;
   vec2 grad = vec2(0.0);
+  float lost = 0.0;
 
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < WAVE_COUNT; i++) {
     vec2 dir = vec2(cos(ang), sin(ang));
     // 細かい波ほど遠方で強く削る
-    float detail = mix(1.0, lod, float(i) / 5.0);
-    grad += dir * cos(dot(p, dir) * freq + uTime * speed) * amp * freq * detail;
+    float detail = mix(1.0, lod, float(i) / float(WAVE_COUNT - 1));
+    float phase = dot(p, dir) * freq + uTime * speed;
+
+    // h = amp * ((sin(phase) + 1) / 2)^2 を phase で微分したもの
+    float slope = (sin(phase) + 1.0) * cos(phase) * 0.5;
+
+    grad += dir * slope * amp * freq * detail;
+    // 削ったぶんの暴れ。これが遠景の滲みになる
+    lost += amp * freq * (1.0 - detail);
 
     // 黄金角ずつ回す。方向が揃って格子模様に見えるのを避ける
     ang += 2.39996;
-    freq *= 1.72;
-    amp *= 0.68;
-    speed *= 1.30;
+    freq *= 1.68;
+    amp *= 0.71;
+    speed *= 1.28;
   }
 
+  blur = lost * BLUR_GAIN;
   return normalize(vec3(-grad.x, 1.0, -grad.y));
 }
 
@@ -150,17 +187,22 @@ void main() {
   vec3 col;
 
   if (rd.y >= 0.0) {
-    col = skyColor(rd);
+    col = skyColor(rd, 0.0);
   } else {
     float dist = min(EYE_HEIGHT / -rd.y, MAX_DISTANCE);
     vec3 hit = vec3(0.0, EYE_HEIGHT, 0.0) + rd * dist;
-    vec3 normal = waterNormal(hit.xz, dist);
+
+    float blur;
+    vec3 normal = waterSurface(hit.xz, dist, blur);
 
     vec3 reflected = reflect(rd, normal);
     // 波が急なところでは反射が下を向く。水面下は写せないので折り返す
     reflected.y = abs(reflected.y);
 
-    col = mix(WATER_DEEP, skyColor(normalize(reflected)), fresnel(-rd, normal));
+    // 水そのものの色。手前ほど視線が立って底の暗さが出る
+    vec3 body = mix(WATER_FAR, WATER_DEEP, clamp(1.0 / (1.0 + dist * 0.5), 0.0, 1.0));
+
+    col = mix(body, skyColor(normalize(reflected), blur), fresnel(-rd, normal));
   }
 
   // 明るいところを圧縮する。月の芯が真っ白に潰れず、光が丸く残る
