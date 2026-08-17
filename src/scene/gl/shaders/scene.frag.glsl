@@ -27,6 +27,23 @@ uniform vec3 uMoonDir;
 uniform float uHorizon;
 /** 動きの控えめさ。prefers-reduced-motion で小さくなる */
 uniform float uMotion;
+/**
+ * 水面からの目の高さ。波の周期はワールド単位で決めるので、この値が
+ * 「どれくらいの大きさの波を見ているか」の基準になる。
+ */
+uniform float uEyeHeight;
+
+/** 同時に扱う波紋の数。溢れたぶんは古いものから捨てる（JS 側） */
+const int MAX_RIPPLES = 12;
+
+/**
+ * 波紋。xy = 水面上の位置 / z = 今の半径 / w = 今の強さ。
+ *
+ * 半径の伸び方と薄れ方は JS 側（ripples.ts）が持っている。式が実装の
+ * 都合で変わらないよう、テストのある側に残して、ここへは結果だけ届く。
+ */
+uniform vec4 uRipples[MAX_RIPPLES];
+uniform int uRippleCount;
 
 out vec4 fragColor;
 
@@ -41,12 +58,6 @@ const vec3 WATER_FAR   = vec3(0.020, 0.032, 0.062);
 const vec3 MOON_TINT   = vec3(0.87, 0.92, 1.00);
 
 // ---- 目の高さと視野 --------------------------------------------------------
-
-/**
- * 水面からの目の高さ。波の周期はワールド単位で決めるので、この値が
- * 「どれくらいの大きさの波を見ているか」の基準になる。
- */
-const float EYE_HEIGHT = 1.0;
 
 /**
  * 水面の交点を求める距離の上限。
@@ -99,7 +110,7 @@ const float MOON_ANGLE = 0.030;
 /** 星の細かさ。大きいほど格子が細かい＝星が多い */
 const float STAR_DENSITY = 46.0;
 
-/** 雲の層の高さ。目の高さ（EYE_HEIGHT = 1.0）に対する比 */
+/** 雲の層の高さ。目の高さ（uEyeHeight）に対する比 */
 const float CLOUD_HEIGHT = 26.0;
 
 const vec3 CLOUD_SHADE = vec3(0.020, 0.028, 0.052);
@@ -234,6 +245,42 @@ const int WAVE_COUNT = 9;
 /** 消した細かい波を、光の広がりへどれだけ振り替えるか */
 const float BLUR_GAIN = 0.24;
 
+/** 波紋の輪の細かさ。大きいほど輪が何重にも重なる */
+const float RIPPLE_FREQ = 5.6;
+
+/** 波紋の高さ。うねりに対してどれくらい立たせるか */
+const float RIPPLE_AMP = 0.13;
+
+/**
+ * 波紋のぶんの傾き。
+ *
+ * 輪の縁（dist == 半径）を山として、その内外へ数周ぶんの波が減衰しながら
+ * 続く形。中心から外へ向かう向きに傾くので、勾配は中心からの方向ベクトルに
+ * 半径方向の微分を掛けたものになる。
+ */
+vec2 rippleGradient(vec2 p) {
+  vec2 grad = vec2(0.0);
+
+  for (int i = 0; i < MAX_RIPPLES; i++) {
+    if (i >= uRippleCount) break;
+
+    vec4 ripple = uRipples[i];
+    vec2 offset = p - ripple.xy;
+    float dist = length(offset);
+    // 輪の縁からの隔たり。ここが 0 の場所がいちばん高く立つ
+    float edge = dist - ripple.z;
+    float envelope = exp(-edge * edge * 5.0);
+    if (envelope < 0.004) continue;
+
+    // h = sin(edge * FREQ) * envelope * 強さ を dist で微分したもの。
+    // envelope の変化は波そのものよりずっと緩いので、そこは無視してよい
+    float slope = cos(edge * RIPPLE_FREQ) * RIPPLE_FREQ * envelope * ripple.w;
+    grad += (offset / max(dist, 1e-4)) * slope * RIPPLE_AMP;
+  }
+
+  return grad;
+}
+
 /**
  * 波の傾き（法線）と、そこで捨てた細かさ（blur）。
  *
@@ -279,6 +326,9 @@ vec3 waterSurface(vec2 p, float dist, out float blur) {
     speed *= 1.28;
   }
 
+  // 波紋を重ねる。うねりと同じく、遠いところでは細部が消える
+  grad += rippleGradient(p) * lod;
+
   blur = lost * BLUR_GAIN;
   return normalize(vec3(-grad.x, 1.0, -grad.y));
 }
@@ -313,8 +363,8 @@ void main() {
   if (rd.y >= 0.0) {
     col = skyColor(rd, 0.0);
   } else {
-    float dist = min(EYE_HEIGHT / -rd.y, MAX_DISTANCE);
-    vec3 hit = vec3(0.0, EYE_HEIGHT, 0.0) + rd * dist;
+    float dist = min(uEyeHeight / -rd.y, MAX_DISTANCE);
+    vec3 hit = vec3(0.0, uEyeHeight, 0.0) + rd * dist;
 
     float blur;
     vec3 normal = waterSurface(hit.xz, dist, blur);
