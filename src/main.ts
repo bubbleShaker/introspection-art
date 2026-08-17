@@ -4,7 +4,7 @@ import { AudioEngine } from './audio/engine.ts'
 import { OnsetDetector } from './audio/onset.ts'
 import { probeTrack } from './audio/track.ts'
 import { silence, type Levels } from './core/levels.ts'
-import { WaterScene } from './scene/waterScene.ts'
+import { GlWaterScene, isSceneSupported } from './scene/gl/glScene.ts'
 
 /** 同梱の音源。無ければドロップで受け取る */
 const BUNDLED_TRACK = `${import.meta.env.BASE_URL}audio/introspection.mp3`
@@ -26,7 +26,7 @@ const PREPARING_MAX_MS = 15000
 /** 音が無い間、これくらいの間隔で水面がひとりでに揺れる(ms) */
 const IDLE_SPLASH_INTERVAL_MS = 2600
 
-const canvas = requireElement<HTMLCanvasElement>('#stage')
+const stage = requireElement<HTMLDivElement>('#stage')
 const overlay = requireElement<HTMLDivElement>('#overlay')
 const enterButton = requireElement<HTMLButtonElement>('#enter')
 const overlayNote = requireElement<HTMLParagraphElement>('#overlay-note')
@@ -36,7 +36,14 @@ const fileInput = requireElement<HTMLInputElement>('#file')
 const status = requireElement<HTMLParagraphElement>('#status')
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-const scene = new WaterScene(canvas, { reducedMotion })
+
+// 描けない端末では、黙って真っ暗な画面を見せるより、そう言った方がいい。
+// 音は鳴らせるので、再生そのものは残す
+const scene = isSceneSupported() ? new GlWaterScene(stage, { reducedMotion }) : null
+
+// WebGL2 が在っても、シェーダーが組み立てられないことはある（uniform の本数、
+// 精度）。そちらは最初に描く時まで分からないので、後からでも伝えられるようにする
+if (scene) scene.onError = (message) => showStatus(message)
 const engine = new AudioEngine()
 const onset = new OnsetDetector()
 
@@ -107,13 +114,17 @@ window.addEventListener('keydown', (event) => {
 // その時もボタンの表示を合わせる
 engine.onChange = () => updateToggleLabel()
 
-// 音声グラフと objectURL を畳んでからページを離れる
-window.addEventListener('pagehide', () => engine.dispose())
+// 音声グラフと objectURL、そして GPU 側の資源を畳んでからページを離れる
+window.addEventListener('pagehide', () => {
+  engine.dispose()
+  scene?.dispose()
+})
 
 async function start(): Promise<void> {
   if (started) return
   started = true
   dismissOverlay()
+  if (!scene) showStatus('この端末では絵を描けません（WebGL2 が要ります）')
   // ここで初めて読み込みの結果を待つ。読めていなければ静かな水面のまま
   if (await bundledTrack) await playOrReport()
   updateToggleLabel()
@@ -242,14 +253,14 @@ function frame(nowMs: number): void {
 
   if (engine.playing) {
     const hit = onset.push(raw.low, nowMs)
-    if (hit !== null) scene.splash(hit, nowMs)
+    if (hit !== null) scene?.splash(hit, nowMs)
   } else if (nowMs >= nextIdleSplashMs) {
     // 無音でも水面は生きている。まばらに、弱く落とす
-    scene.splash(0.22 + Math.random() * 0.2, nowMs)
+    scene?.splash(0.22 + Math.random() * 0.2, nowMs)
     nextIdleSplashMs = nowMs + IDLE_SPLASH_INTERVAL_MS * (0.6 + Math.random() * 0.9)
   }
 
-  scene.draw(levels, nowMs)
+  scene?.draw(levels, nowMs)
   requestAnimationFrame(frame)
 }
 
@@ -258,14 +269,14 @@ requestAnimationFrame(frame)
 // ---- 画面まわり ------------------------------------------------------------
 
 // resize は連続で飛ぶ（モバイルの URL バー伸縮、ウィンドウのドラッグ）。
-// 1 フレームにひとつへ畳まないと、その都度キャンバスを 3 枚張り直すことになる
+// 1 フレームにひとつへ畳まないと、その都度キャンバスと描画用の面を張り直すことになる
 let resizePending = false
 window.addEventListener('resize', () => {
   if (resizePending) return
   resizePending = true
   requestAnimationFrame(() => {
     resizePending = false
-    scene.resize()
+    scene?.resize()
   })
 })
 

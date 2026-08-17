@@ -12,7 +12,11 @@
     <title>Introspection — 水面と反射</title>
   </head>
   <body>
-    <canvas id="stage" role="img" aria-label="音に反応して揺れる水面と、その反射"></canvas>
+    <!--
+      絵は p5 が作る canvas に描く。ここは置き場所だけを用意する。
+      role と aria-label は、生成された canvas 側に付ける（glScene.ts）。
+    -->
+    <div id="stage"></div>
 
     <div id="overlay">
       <h1>Introspection</h1>
