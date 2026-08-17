@@ -20,6 +20,8 @@ const overlay = requireElement<HTMLDivElement>('#overlay')
 const enterButton = requireElement<HTMLButtonElement>('#enter')
 const overlayNote = requireElement<HTMLParagraphElement>('#overlay-note')
 const toggleButton = requireElement<HTMLButtonElement>('#toggle')
+const pickButton = requireElement<HTMLButtonElement>('#pick')
+const fileInput = requireElement<HTMLInputElement>('#file')
 const status = requireElement<HTMLParagraphElement>('#status')
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -34,6 +36,24 @@ let trackReady = false
 let started = false
 let nextIdleSplashMs = 0
 
+/**
+ * 今どこから来た音源を持っているか。
+ *
+ * 同梱の音源が在るかの確認は通信なので、いつ返るか分からない。その間に
+ * ユーザーが自分の音源を渡していることがあり、あとから来た確認結果で
+ * それを上書きしてはいけない。渡されたものが常に優先する。
+ */
+let trackFrom: 'none' | 'bundled' | 'user' = 'none'
+
+/**
+ * 音源を採り込んだ回数。続けて渡された時、古い呼び出しの後始末が
+ * 新しい音源の表示を書き換えないようにするための番号。
+ */
+let adoptions = 0
+
+/** 音源は持っているが、まだ鳴り始めていない */
+let preparing = false
+
 // ---- 起動 ------------------------------------------------------------------
 
 // 入口は読み込みを待たない。待たせると、音源が返ってこない回線で
@@ -42,11 +62,17 @@ enterButton.disabled = false
 enterButton.textContent = 'はじめる'
 
 const bundledTrack = probeTrack(BUNDLED_TRACK).then((found) => {
-  if (found) engine.attach(BUNDLED_TRACK)
+  // 待っている間にユーザーが音源を渡していたら、それを奪わない
+  if (trackFrom === 'user') return false
+
+  if (found) {
+    engine.attach(BUNDLED_TRACK)
+    trackFrom = 'bundled'
+  }
   trackReady = found
   overlayNote.textContent = found
     ? 'Introspection — Mona Wonderlick'
-    : '音源が見つかりません。mp3 をこの画面にドロップすると、その曲で水面が揺れます'
+    : '音源が見つかりません。下の「音源を選ぶ」から、手元の曲で水面を揺らせます'
   updateToggleLabel()
   return found
 })
@@ -132,22 +158,52 @@ window.addEventListener('drop', (event) => {
   if (file) void adoptFile(file)
 })
 
+// ---- 音源のファイル選択 ----------------------------------------------------
+
+pickButton.addEventListener('click', () => fileInput.click())
+
+fileInput.addEventListener('change', () => {
+  const file = fileInput.files?.[0]
+  // 選ばずに閉じた時は files が空。何もしない
+  if (!file) return
+  // 同じ音源をもう一度選んだ時にも change が飛ぶよう、値を空に戻しておく。
+  // File は上で受け取り済みで、入力を空にしても中身は失われない
+  fileInput.value = ''
+  void adoptFile(file)
+})
+
 /**
- * 拡張子や MIME で弾かない。type が空になる形式（環境によっては .flac や
- * .opus）があるので、鳴らせるかどうかは実際に再生してみて決める。
+ * 受け取った音源を採り込む。ドロップとファイル選択の共通の受け口。
+ *
+ * ここでは拡張子や MIME で弾かない。type が空になる形式（環境によっては
+ * .flac や .opus）があるので、鳴らせるかどうかは実際に再生してみて決める。
+ * ファイル選択の accept はあくまで候補を絞る入口の便宜で、検証ではない。
  */
 async function adoptFile(file: File): Promise<void> {
+  const adoption = ++adoptions
   engine.attach(file)
+  trackFrom = 'user'
   trackReady = true
   started = true
+  preparing = true
   dismissOverlay()
+  // 再生が始まるのを待たずに操作を出す。音の準備は環境によって数秒かかることが
+  // あり、その間ボタンが無いと「渡せたのかどうか」が分からない
+  updateToggleLabel()
+
+  let message: string
   try {
     await engine.play()
-    showStatus(engine.sourceLabel ?? '')
+    message = engine.sourceLabel ?? ''
   } catch {
-    showStatus('この音源は再生できませんでした')
+    message = 'この音源は再生できませんでした'
   }
+
+  // 待っている間に別の音源が渡されていたら、古い結果は表に出さない
+  if (adoption !== adoptions) return
+  preparing = false
   updateToggleLabel()
+  if (message) showStatus(message)
 }
 
 // ---- 毎フレーム ------------------------------------------------------------
@@ -190,7 +246,10 @@ window.addEventListener('resize', () => {
 
 function updateToggleLabel(): void {
   toggleButton.hidden = !trackReady
-  toggleButton.textContent = engine.playing ? '一時停止' : '再生'
+  // 鳴り始めるまでは押させない。「再生」と出したまま押せると、
+  // 始まりかけの再生にもう一本重ねてしまう
+  toggleButton.disabled = preparing
+  toggleButton.textContent = preparing ? '準備中' : engine.playing ? '一時停止' : '再生'
   toggleButton.setAttribute('aria-pressed', String(engine.playing))
 }
 

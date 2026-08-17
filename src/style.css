@@ -133,9 +133,12 @@ button:disabled {
   margin: 0;
 }
 
-#chrome #toggle {
+#chrome button {
   padding: 0.5em 1.4em;
   font-size: 0.7rem;
+  /* 画の邪魔をしないよう縮まない。文字が折り返すとボタンに見えなくなる */
+  flex: none;
+  white-space: nowrap;
 }
 
 #chrome .credit strong {
@@ -194,6 +197,29 @@ body.is-dropping::after {
 @media (max-width: 560px) {
   #chrome .hint {
     margin-left: 0;
+  }
+}
+
+/*
+ * 目には入らないが、レイアウト上は存在する。display: none にすると
+ * click() を無視する実装があるため、隠し方をこちらに寄せている。
+ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* 触って操作する端末にドラッグ&ドロップは無い。できない案内は出さない */
+@media (hover: none) {
+  #chrome .hint {
+    display: none;
   }
 }
 

@@ -28,7 +28,24 @@
         Music: <strong>Introspection</strong> — Mona Wonderlick
         <a href="https://youtu.be/UZzuVt7nKOA" target="_blank" rel="noopener noreferrer">YouTube</a>
       </p>
-      <p class="hint">音源をドロップすると、その曲で水面が揺れます</p>
+      <p class="hint">ドロップでも渡せます</p>
+      <!--
+        スマホにはドラッグ&ドロップが無いので、ファイル選択の口を用意する。
+        入力そのものは見せず、隣のボタンから開く（見た目を他のボタンと揃えるため）。
+
+        hidden ではなく visually-hidden なのは、display: none の input への
+        click() を無視する実装があるため。レイアウト上は在るまま、目にだけ入らない。
+        操作の窓口はボタン一つに絞るので、input は支援技術とタブ順から外す。
+      -->
+      <input
+        id="file"
+        class="visually-hidden"
+        type="file"
+        accept="audio/*,.flac,.opus,.m4a"
+        tabindex="-1"
+        aria-hidden="true"
+      />
+      <button id="pick" type="button">音源を選ぶ</button>
     </footer>
 
     <script type="module" src="/src/main.ts"></script>
