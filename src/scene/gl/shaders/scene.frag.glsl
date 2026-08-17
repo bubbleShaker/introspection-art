@@ -329,7 +329,10 @@ vec3 waterSurface(vec2 p, float dist, out float blur) {
   // 波紋を重ねる。うねりと同じく、遠いところでは細部が消える
   grad += rippleGradient(p) * lod;
 
-  blur = lost * BLUR_GAIN;
+  // 手前でも 0 にはしない。実際の水面には必ず目に見えないさざ波があり、
+  // 完全な鏡になることはない。0 にすると、たまたま月を正面から返した
+  // ひとつの面が月をそのまま映して、丸い光の塊になってしまう
+  blur = lost * BLUR_GAIN + 0.006;
   return normalize(vec3(-grad.x, 1.0, -grad.y));
 }
 
@@ -346,11 +349,9 @@ float fresnel(vec3 view, vec3 normal) {
 }
 
 // ---- 仕上げ ----------------------------------------------------------------
-
-/** 暗いグラデーションに出る縞（バンディング）を、1/255 未満の揺らぎで散らす */
-float dither(vec2 co) {
-  return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-}
+//
+// ビネットとディザは、この後のブルームを重ねてからでないと意味がない。
+// composite.frag が受け持つ。ここでは色を決めるところまでで手を止める。
 
 void main() {
   // 画面中央を原点にし、縦で正規化する。横長でも縦の見え方が変わらない
@@ -381,12 +382,6 @@ void main() {
 
   // 明るいところを圧縮する。月の芯が真っ白に潰れず、光が丸く残る
   col = col / (1.0 + col);
-
-  // 四隅を落として、視線を中央の光の柱へ集める
-  vec2 q = gl_FragCoord.xy / uResolution - 0.5;
-  col *= 1.0 - dot(q, q) * 0.95;
-
-  col += (dither(gl_FragCoord.xy) - 0.5) / 255.0;
 
   fragColor = vec4(col, 1.0);
 }

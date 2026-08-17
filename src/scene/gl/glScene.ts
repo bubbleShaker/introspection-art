@@ -1,7 +1,9 @@
 import p5 from 'p5'
 import type { Levels } from '../../core/levels.ts'
 import { opacityRatio, progress, radiusRatio, RippleField } from '../ripples.ts'
-import fragmentSource from './shaders/scene.frag.glsl?raw'
+import bloomSource from './shaders/bloom.frag.glsl?raw'
+import compositeSource from './shaders/composite.frag.glsl?raw'
+import sceneSource from './shaders/scene.frag.glsl?raw'
 import vertexSource from './shaders/scene.vert.glsl?raw'
 
 /**
@@ -39,12 +41,31 @@ const MAX_RIPPLES = 12
 /** 波紋の広がりきった半径（ワールド単位） */
 const RIPPLE_MAX_RADIUS = 0.85
 
+/**
+ * 滲みを作る面の粗さ。1 が原寸で、2 なら縦横それぞれ半分。
+ *
+ * ぼかした結果しか使わないので粗くてよく、粗いほど拾う画素の間隔を
+ * 広く取れる（＝同じ点数で広く滲む）。描く面積も 1/4 で済む。
+ */
+const BLOOM_DOWNSCALE = 2
+
+/** 滲みをどれくらい広げるか（滲み面の画素数） */
+const BLOOM_RADIUS = 26
+
 export class GlWaterScene {
   private readonly instance: p5
   private readonly motion: number
   private readonly random: () => number
 
-  private shader: p5.Shader | null = null
+  private sceneShader: p5.Shader | null = null
+  private bloomShader: p5.Shader | null = null
+  private compositeShader: p5.Shader | null = null
+
+  /** シーンを一度ここへ描く。滲みを作るには、出来上がった絵が要る */
+  private sceneBuffer: p5.Framebuffer | null = null
+  /** 明るいところだけを集めてぼかした面。原寸より粗い */
+  private bloomBuffer: p5.Framebuffer | null = null
+
   private levels: Levels = { low: 0, mid: 0, high: 0 }
 
   private readonly ripples = new RippleField()
@@ -83,7 +104,16 @@ export class GlWaterScene {
         // 板を貼るだけなので、輪郭線は要らない
         sketch.noStroke()
         sketch.pixelDensity(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_DENSITY))
-        this.shader = sketch.createShader(vertexSource, fragmentSource)
+
+        this.sceneShader = sketch.createShader(vertexSource, sceneSource)
+        this.bloomShader = sketch.createShader(vertexSource, bloomSource)
+        this.compositeShader = sketch.createShader(vertexSource, compositeSource)
+
+        this.sceneBuffer = sketch.createFramebuffer()
+        this.bloomBuffer = sketch.createFramebuffer({
+          width: Math.max(1, Math.ceil(sketch.width / BLOOM_DOWNSCALE)),
+          height: Math.max(1, Math.ceil(sketch.height / BLOOM_DOWNSCALE)),
+        })
 
         // 音に反応する絵そのものは、支援技術には読めない。何が映っているかを
         // 言葉で置いておく
@@ -107,6 +137,13 @@ export class GlWaterScene {
     }
     if (next.width === width && next.height === height) return
     this.instance.resizeCanvas(next.width, next.height)
+
+    // シーン用は canvas に追従して自動で取り直されるが、粗い滲み用は
+    // 自前の大きさなので、こちらで合わせ直す
+    this.bloomBuffer?.resize(
+      Math.max(1, Math.ceil(next.width / BLOOM_DOWNSCALE)),
+      Math.max(1, Math.ceil(next.height / BLOOM_DOWNSCALE)),
+    )
   }
 
   /**
@@ -182,32 +219,65 @@ export class GlWaterScene {
     this.rippleCount = count
   }
 
-  /** p5 の draw から呼ばれる。uniform を詰めて板を 1 枚描く */
+  /**
+   * p5 の draw から呼ばれる。三度に分けて描く。
+   *
+   *   1. シーンを面へ描く
+   *   2. その明るいところだけを集め、粗い面でぼかす
+   *   3. 二つを重ねて画面へ出す
+   *
+   * 滲みを作るには一度出来上がった絵が要るので、直接画面へは描けない。
+   */
   private render(sketch: p5): void {
-    const shader = this.shader
-    if (!shader) return
+    const scene = this.sceneShader
+    const bloom = this.bloomShader
+    const composite = this.compositeShader
+    const sceneBuffer = this.sceneBuffer
+    const bloomBuffer = this.bloomBuffer
+    if (!scene || !bloom || !composite || !sceneBuffer || !bloomBuffer) return
 
     const density = sketch.pixelDensity()
-    const width = sketch.width * density
-    const height = sketch.height * density
 
-    sketch.shader(shader)
-    shader.setUniform('uResolution', [width, height])
-    shader.setUniform('uTime', this.time)
-    shader.setUniform('uLow', this.levels.low)
-    shader.setUniform('uMid', this.levels.mid)
-    shader.setUniform('uHigh', this.levels.high)
-    shader.setUniform('uHorizon', HORIZON_UV)
-    shader.setUniform('uMotion', this.motion)
-    shader.setUniform('uEyeHeight', EYE_HEIGHT)
-    shader.setUniform('uRipples', this.rippleBuffer)
-    shader.setUniform('uRippleCount', this.rippleCount)
-    shader.setUniform('uMoonDir', this.moonDirection(sketch.width / sketch.height))
+    sceneBuffer.begin()
+    sketch.shader(scene)
+    scene.setUniform('uResolution', [sketch.width * density, sketch.height * density])
+    scene.setUniform('uTime', this.time)
+    scene.setUniform('uLow', this.levels.low)
+    scene.setUniform('uMid', this.levels.mid)
+    scene.setUniform('uHigh', this.levels.high)
+    scene.setUniform('uHorizon', HORIZON_UV)
+    scene.setUniform('uMotion', this.motion)
+    scene.setUniform('uEyeHeight', EYE_HEIGHT)
+    scene.setUniform('uRipples', this.rippleBuffer)
+    scene.setUniform('uRippleCount', this.rippleCount)
+    scene.setUniform('uMoonDir', this.moonDirection(sketch.width / sketch.height))
+    this.fill(sketch, sceneBuffer.width, sceneBuffer.height)
+    sceneBuffer.end()
 
-    // 板は標準の行列変換で置く。フラグメント側は gl_FragCoord から座標を
-    // 作るので、多少はみ出していても絵はずれない。少し大きめにして
-    // 丸め誤差で端が 1px 欠けるのを防ぐ
-    sketch.plane(sketch.width * 1.02, sketch.height * 1.02)
+    bloomBuffer.begin()
+    sketch.shader(bloom)
+    bloom.setUniform('uScene', sceneBuffer)
+    bloom.setUniform('uRadius', BLOOM_RADIUS)
+    this.fill(sketch, bloomBuffer.width, bloomBuffer.height)
+    bloomBuffer.end()
+
+    sketch.shader(composite)
+    composite.setUniform('uScene', sceneBuffer)
+    composite.setUniform('uBloom', bloomBuffer)
+    // 中域が厚いほど光が溢れる
+    composite.setUniform('uBloomStrength', 0.55 + this.levels.mid * 0.8)
+    this.fill(sketch, sketch.width, sketch.height)
+  }
+
+  /**
+   * 描き先いっぱいに板を張る。
+   *
+   * ほんの少し大きめにしているのは、丸め誤差で端に 1px の隙間ができるのを
+   * 防ぐため。板の大きさが変わっても頂点に載る texCoord は 0..1 のままなので、
+   * 絵がずれるのではなく 1% だけ寄る。
+   */
+  private fill(sketch: p5, width: number, height: number): void {
+    sketch.plane(width * 1.02, height * 1.02)
   }
 
   /**
