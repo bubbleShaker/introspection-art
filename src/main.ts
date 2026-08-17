@@ -4,7 +4,7 @@ import { AudioEngine } from './audio/engine.ts'
 import { OnsetDetector } from './audio/onset.ts'
 import { probeTrack } from './audio/track.ts'
 import { silence, type Levels } from './core/levels.ts'
-import { WaterScene } from './scene/waterScene.ts'
+import { GlWaterScene } from './scene/gl/glScene.ts'
 
 /** 同梱の音源。無ければドロップで受け取る */
 const BUNDLED_TRACK = `${import.meta.env.BASE_URL}audio/introspection.mp3`
@@ -26,7 +26,7 @@ const PREPARING_MAX_MS = 15000
 /** 音が無い間、これくらいの間隔で水面がひとりでに揺れる(ms) */
 const IDLE_SPLASH_INTERVAL_MS = 2600
 
-const canvas = requireElement<HTMLCanvasElement>('#stage')
+const stage = requireElement<HTMLDivElement>('#stage')
 const overlay = requireElement<HTMLDivElement>('#overlay')
 const enterButton = requireElement<HTMLButtonElement>('#enter')
 const overlayNote = requireElement<HTMLParagraphElement>('#overlay-note')
@@ -36,7 +36,7 @@ const fileInput = requireElement<HTMLInputElement>('#file')
 const status = requireElement<HTMLParagraphElement>('#status')
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-const scene = new WaterScene(canvas, { reducedMotion })
+const scene = new GlWaterScene(stage, { reducedMotion })
 const engine = new AudioEngine()
 const onset = new OnsetDetector()
 
