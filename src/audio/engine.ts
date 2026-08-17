@@ -1,20 +1,26 @@
 import { silence, type Levels } from '../core/levels.ts'
 import { BandAnalyser } from './bandAnalyser.ts'
+import { WaveAnalyser } from './waveAnalyser.ts'
 
 /**
- * 音源の再生を受け持つ。解析そのものは BandAnalyser に任せる。
+ * 音源の再生を受け持つ。解析そのものは BandAnalyser と WaveAnalyser に任せる。
  *
  * <audio> 要素を噛ませているのは、mp3 全体をメモリに展開せずに
  * 流し始められること、ループや一時停止をブラウザ任せにできることによる。
  * その音を MediaElementAudioSourceNode で Web Audio 側に引き込み、
  * 解析ノードを通してからスピーカーへ返す。
  *
- *   <audio> → MediaElementSource → Analyser → destination
+ *   <audio> → MediaElementSource → BandAnalyser → WaveAnalyser → destination
+ *
+ * 解析ノードは音を素通しするので、二つを数珠つなぎにしても聞こえ方は変わらない。
+ * 枝分かれさせてそれぞれ destination へ繋ぐと、同じ音が二重に足されて
+ * 大きくなってしまう。
  */
 export class AudioEngine {
   private readonly element: HTMLAudioElement
   private context: AudioContext | null = null
   private analyser: BandAnalyser | null = null
+  private waveAnalyser: WaveAnalyser | null = null
   private objectUrl: string | null = null
   private label: string | null = null
   /** play() が通ったか。paused だけでは失敗直後を見分けられない */
@@ -126,6 +132,20 @@ export class AudioEngine {
   }
 
   /**
+   * 現在の波形を out へ書き出す。解析器が無い／止まっている間は 0 で埋める。
+   *
+   * levels() と違って書き込み先を受け取るのは、これが毎フレーム走る 128 点の
+   * 配列だから。返り値にすると 1 秒に 60 本の配列を捨てることになる。
+   */
+  readWave(out: Float32Array): void {
+    if (!this.waveAnalyser || !this.playing) {
+      out.fill(0)
+      return
+    }
+    this.waveAnalyser.read(out)
+  }
+
+  /**
    * 後始末。ページを離れる時に呼ぶ。
    *
    * これを呼んだ engine は作り直すしかない。MediaElementSource は
@@ -139,6 +159,7 @@ export class AudioEngine {
     const context = this.context
     this.context = null
     this.analyser = null
+    this.waveAnalyser = null
     void context?.close()
   }
 
@@ -147,14 +168,17 @@ export class AudioEngine {
 
     const context = new AudioContext()
     const analyser = new BandAnalyser(context)
+    const wave = new WaveAnalyser(context)
 
     // MediaElementSource は同じ要素に対して一度しか作れない。
     // context ごと使い回すので、ここが唯一の生成箇所になる
     context.createMediaElementSource(this.element).connect(analyser.node)
-    analyser.node.connect(context.destination)
+    analyser.node.connect(wave.node)
+    wave.node.connect(context.destination)
 
     this.context = context
     this.analyser = analyser
+    this.waveAnalyser = wave
   }
 
   /** 鳴っているかの記録を更新し、変わっていれば呼び出し側に知らせる */

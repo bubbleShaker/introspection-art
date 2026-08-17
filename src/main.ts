@@ -3,6 +3,7 @@ import { smooth } from './audio/bands.ts'
 import { AudioEngine } from './audio/engine.ts'
 import { OnsetDetector } from './audio/onset.ts'
 import { probeTrack } from './audio/track.ts'
+import { followWave, silentWave } from './audio/waveform.ts'
 import { silence, type Levels } from './core/levels.ts'
 import { GlWaterScene, isSceneSupported } from './scene/gl/glScene.ts'
 
@@ -49,6 +50,18 @@ const onset = new OnsetDetector()
 
 /** 生の解析値をならしたもの。これを画に渡す */
 const levels: Levels = silence()
+
+/** 波形。生を受ける入れ物と、ならしたものの二本を使い回す */
+const rawWave = silentWave()
+const wave = silentWave()
+
+/**
+ * 波形が今の値に追いつく速さ。
+ *
+ * 動きを抑える設定では、輪郭が毎フレーム速く脈打たないよう鈍らせる。
+ * 細い白線は水面の揺れより目につくので、こちらにも同じ配慮を効かせる。
+ */
+const WAVE_FOLLOW = reducedMotion ? 0.2 : 0.45
 
 let trackReady = false
 let started = false
@@ -251,6 +264,9 @@ function frame(nowMs: number): void {
   levels.mid = smooth(levels.mid, raw.mid, 0.35, 0.05)
   levels.high = smooth(levels.high, raw.high, 0.6, 0.12)
 
+  engine.readWave(rawWave)
+  followWave(wave, rawWave, WAVE_FOLLOW)
+
   if (engine.playing) {
     const hit = onset.push(raw.low, nowMs)
     if (hit !== null) scene?.splash(hit, nowMs)
@@ -260,7 +276,7 @@ function frame(nowMs: number): void {
     nextIdleSplashMs = nowMs + IDLE_SPLASH_INTERVAL_MS * (0.6 + Math.random() * 0.9)
   }
 
-  scene?.draw(levels, nowMs)
+  scene?.draw(levels, wave, nowMs)
   requestAnimationFrame(frame)
 }
 
