@@ -56,6 +56,15 @@ body {
   pointer-events: none;
 }
 
+/*
+ * 消えたあとに畳む。フェードは見た目のためのもので、消えること自体を
+ * トランジションに委ねない。走らない環境があると入口が画を覆ったまま残る。
+ * display を grid にしている以上、hidden 属性の既定は効かないので明示する。
+ */
+#overlay[hidden] {
+  display: none;
+}
+
 #overlay h1 {
   margin: 0;
   font-size: clamp(2rem, 7vw, 3.6rem);

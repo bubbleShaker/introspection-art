@@ -9,6 +9,9 @@ import { WaterScene } from './scene/waterScene.ts'
 /** 同梱の音源。無ければドロップで受け取る */
 const BUNDLED_TRACK = `${import.meta.env.BASE_URL}audio/introspection.mp3`
 
+/** 入口が消えるまで(ms)。style.css の transition と揃える */
+const OVERLAY_FADE_MS = 1400
+
 /** 音が無い間、これくらいの間隔で水面がひとりでに揺れる(ms) */
 const IDLE_SPLASH_INTERVAL_MS = 2600
 
@@ -69,10 +72,23 @@ window.addEventListener('pagehide', () => engine.dispose())
 async function start(): Promise<void> {
   if (started) return
   started = true
-  overlay.classList.add('is-hidden')
+  dismissOverlay()
   // ここで初めて読み込みの結果を待つ。読めていなければ静かな水面のまま
   if (await bundledTrack) await playOrReport()
   updateToggleLabel()
+}
+
+/**
+ * 入口を閉じる。
+ *
+ * フェードは見た目のためのもので、消えること自体はトランジションに
+ * 委ねない。走らない環境があると、入口が画を覆ったまま残ってしまう。
+ */
+function dismissOverlay(): void {
+  overlay.classList.add('is-hidden')
+  window.setTimeout(() => {
+    overlay.hidden = true
+  }, OVERLAY_FADE_MS)
 }
 
 function toggleAudio(): void {
@@ -124,7 +140,7 @@ async function adoptFile(file: File): Promise<void> {
   engine.attach(file)
   trackReady = true
   started = true
-  overlay.classList.add('is-hidden')
+  dismissOverlay()
   try {
     await engine.play()
     showStatus(engine.sourceLabel ?? '')
