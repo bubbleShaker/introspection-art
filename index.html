@@ -36,15 +36,13 @@
         hidden ではなく visually-hidden なのは、display: none の input への
         click() を無視する実装があるため。レイアウト上は在るまま、目にだけ入らない。
         操作の窓口はボタン一つに絞るので、input は支援技術とタブ順から外す。
+
+        accept は付けない。ダイアログは accept を OS の拡張子→MIME 対応表から
+        展開するので、関連付け次第で正当な mp3 まで選べなくなる。そもそも型では
+        弾かない方針（鳴らせるかは再生してみて決める）なので、絞る利より
+        選べなくなる害の方が大きい。
       -->
-      <input
-        id="file"
-        class="visually-hidden"
-        type="file"
-        accept="audio/*,.flac,.opus,.m4a"
-        tabindex="-1"
-        aria-hidden="true"
-      />
+      <input id="file" class="visually-hidden" type="file" tabindex="-1" aria-hidden="true" />
       <button id="pick" type="button">音源を選ぶ</button>
     </footer>
 
