@@ -12,6 +12,17 @@ const BUNDLED_TRACK = `${import.meta.env.BASE_URL}audio/introspection.mp3`
 /** 入口が消えるまで(ms)。style.css の transition と揃える */
 const OVERLAY_FADE_MS = 1400
 
+/**
+ * 「準備中」と出しておく上限(ms)。
+ *
+ * 再生の開始そのものは待ち続けてよいが、待っている間ずっとボタンを
+ * 押せなくしてはいけない。始まらない時に打つ手が無くなる。
+ *
+ * 20MB の mp3 で実測 4 秒ほどだったので、そこに近い値にすると正常な待ちで
+ * 毎回めくれてしまう。回線の細い端末も見込んで、明らかに長い側に置く。
+ */
+const PREPARING_MAX_MS = 15000
+
 /** 音が無い間、これくらいの間隔で水面がひとりでに揺れる(ms) */
 const IDLE_SPLASH_INTERVAL_MS = 2600
 
@@ -92,6 +103,10 @@ window.addEventListener('keydown', (event) => {
   else toggleAudio()
 })
 
+// 再生は、こちらが頼まなくても止まる（OS のメディア操作、イヤホンを抜く）。
+// その時もボタンの表示を合わせる
+engine.onChange = () => updateToggleLabel()
+
 // 音声グラフと objectURL を畳んでからページを離れる
 window.addEventListener('pagehide', () => engine.dispose())
 
@@ -118,6 +133,9 @@ function dismissOverlay(): void {
 }
 
 function toggleAudio(): void {
+  // 開始を頼んでいる最中は待つ。ここで重ねると、中断された方の失敗が
+  // 「再生できませんでした」として表に出てしまう
+  if (engine.starting) return
   if (engine.playing) {
     engine.pause()
     updateToggleLabel()
@@ -176,8 +194,8 @@ fileInput.addEventListener('change', () => {
  * 受け取った音源を採り込む。ドロップとファイル選択の共通の受け口。
  *
  * ここでは拡張子や MIME で弾かない。type が空になる形式（環境によっては
- * .flac や .opus）があるので、鳴らせるかどうかは実際に再生してみて決める。
- * ファイル選択の accept はあくまで候補を絞る入口の便宜で、検証ではない。
+ * .flac や .opus）があるうえ、そもそも「鳴らせるか」は再生してみるまで
+ * 分からない。音源でないものを渡された時は play() が投げるので、そこで伝える。
  */
 async function adoptFile(file: File): Promise<void> {
   const adoption = ++adoptions
@@ -190,6 +208,12 @@ async function adoptFile(file: File): Promise<void> {
   // 再生が始まるのを待たずに操作を出す。音の準備は環境によって数秒かかることが
   // あり、その間ボタンが無いと「渡せたのかどうか」が分からない
   updateToggleLabel()
+  // 待ちが長引いても、押せないままにはしない
+  const giveUpWaiting = window.setTimeout(() => {
+    if (adoption !== adoptions || !preparing) return
+    preparing = false
+    updateToggleLabel()
+  }, PREPARING_MAX_MS)
 
   let message: string
   try {
@@ -199,6 +223,7 @@ async function adoptFile(file: File): Promise<void> {
     message = 'この音源は再生できませんでした'
   }
 
+  window.clearTimeout(giveUpWaiting)
   // 待っている間に別の音源が渡されていたら、古い結果は表に出さない
   if (adoption !== adoptions) return
   preparing = false
