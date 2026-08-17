@@ -57,10 +57,118 @@ const float EYE_HEIGHT = 1.0;
  */
 const float MAX_DISTANCE = 900.0;
 
+// ---- ノイズ ----------------------------------------------------------------
+
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+/** 値ノイズ。格子点に置いた乱数を滑らかに繋ぐ */
+float valueNoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  // 3t^2 - 2t^3 で補間する。両端で傾きが 0 になるので、格子の継ぎ目が見えない
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(hash21(i), hash21(i + vec2(1.0, 0.0)), u.x),
+    mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x),
+    u.y
+  );
+}
+
+/** 倍の細かさを半分の強さで重ねる。雲のような、大小の入れ子になった形を作る */
+float fbm(vec2 p) {
+  float sum = 0.0;
+  float amp = 0.5;
+  for (int i = 0; i < 5; i++) {
+    sum += valueNoise(p) * amp;
+    // ずらしながら倍へ。ずらさないと各段の格子が同じ場所で揃ってしまう
+    p = p * 2.03 + 17.3;
+    amp *= 0.5;
+  }
+  return sum;
+}
+
 // ---- 空 --------------------------------------------------------------------
 
 /** 月の見かけの大きさ（半径・ラジアン） */
 const float MOON_ANGLE = 0.030;
+
+/** 星の細かさ。大きいほど格子が細かい＝星が多い */
+const float STAR_DENSITY = 46.0;
+
+/** 雲の層の高さ。目の高さ（EYE_HEIGHT = 1.0）に対する比 */
+const float CLOUD_HEIGHT = 26.0;
+
+const vec3 CLOUD_SHADE = vec3(0.020, 0.028, 0.052);
+const vec3 CLOUD_LIT   = vec3(0.46, 0.55, 0.78);
+
+/**
+ * 星。
+ *
+ * 方向を球面の格子に切り、セルごとに 1 つ置く。反射から引かれた時は
+ * blur のぶんだけ溶けて消える（点光源をぼかさずに水面へ写すと、
+ * 遠景が砂嵐のようにちらつく）。
+ */
+float stars(vec3 dir, float blur) {
+  float legible = exp(-blur * 70.0);
+  if (legible < 0.004) return 0.0;
+
+  // 天頂の一点で歪む投影だが、そこは画面に入らない
+  vec2 sv = vec2(atan(dir.z, dir.x), acos(clamp(dir.y, -1.0, 1.0))) * STAR_DENSITY;
+  vec2 cell = floor(sv);
+
+  float seed = hash21(cell);
+  // 疎に置く。全部のセルに星があると、格子が透けて見える
+  float exists = smoothstep(0.84, 0.97, seed);
+  if (exists <= 0.0) return 0.0;
+
+  vec2 pos = vec2(hash21(cell + 3.7), hash21(cell + 9.1));
+  float shape = smoothstep(0.17, 0.0, length(fract(sv) - pos));
+
+  // 高域が強いほど強く瞬く。星ごとに速さと位相を変える
+  float twinkle = 0.45 + 0.55 * sin(uTime * (1.4 + seed * 4.0) + seed * 43.0);
+  twinkle = mix(0.78, twinkle, 0.3 + uHigh * 0.7);
+
+  return shape * exists * twinkle * legible;
+}
+
+/** 天の川の走る向き（帯の法線）。この向きに近い方向ほど帯から遠い */
+const vec3 GALAXY_AXIS = vec3(0.62, 0.47, 0.63);
+
+/**
+ * 天の川。
+ *
+ * 大円に沿った帯なので、ある軸との内積が 0 に近い方向ほど濃い。
+ * 濃淡は fbm で散らす。星のような点ではなく面で光るので、
+ * 反射に写しても点滅しない（blur では消さず、薄めるだけでよい）。
+ */
+float galaxy(vec3 dir, float blur) {
+  float off = dot(dir, normalize(GALAXY_AXIS));
+  float band = exp(-off * off * 15.0);
+  float n = fbm(vec2(atan(dir.z, dir.x) * 2.4, dir.y * 3.6) * 1.7);
+  // 濃い所と抜けた所の差を強めに取ると、雲状の粒立ちが出る
+  return band * (0.22 + n * n * 1.5) / (1.0 + blur * 26.0);
+}
+
+/**
+ * 雲の濃さ。
+ *
+ * 高さ CLOUD_HEIGHT の平らな層と視線の交点でノイズを引く。低い角度ほど
+ * 交点が遠くへ飛ぶので、雲が水平線際で横に潰れて層に見える。
+ */
+float clouds(vec3 dir, float blur) {
+  float up = max(dir.y, 0.0);
+  vec2 p = dir.xz * (CLOUD_HEIGHT / max(up, 0.02)) * 0.02;
+
+  float mass = smoothstep(0.38, 0.70, fbm(p + vec2(uTime * 0.012, uTime * 0.004)));
+  // 水平線のすぐ上に帯として溜め、天頂へ向かって切れていく
+  float band = smoothstep(0.0, 0.05, up) * exp(-up * 2.6);
+  // 水面で暴れている方向では、雲の形は残らない
+  return mass * band * (1.0 - smoothstep(0.0, 0.045, blur));
+}
 
 /**
  * ある方向を見たときの空の色。
@@ -79,8 +187,18 @@ vec3 skyColor(vec3 dir, float blur) {
   float up = clamp(dir.y, 0.0, 1.0);
   vec3 col = mix(SKY_HORIZON, SKY_TOP, pow(up, 0.42));
 
-  // 月。中域が厚いほどわずかに膨らみ、暈も強くなる
+  // 月からの角度。星の見え方も雲の照らされ方も、これで決まる
   float ang = acos(clamp(dot(dir, uMoonDir), -1.0, 1.0));
+
+  // 月明かりに負けて、月のそばでは星も天の川も見えなくなる
+  float darkness = smoothstep(0.10, 0.60, ang);
+
+  // 天の川。空の背景側なので、星より先に置く
+  col += vec3(0.30, 0.36, 0.58) * galaxy(dir, blur) * 0.16 * darkness;
+
+  col += vec3(0.80, 0.86, 1.0) * stars(dir, blur) * 0.85 * darkness;
+
+  // 月。中域が厚いほどわずかに膨らみ、暈も強くなる
   float radius = MOON_ANGLE * (1.0 + uMid * 0.22) + blur;
   // 広がったぶんは薄める。同じ光の量が広い面積へ散る
   float spread = MOON_ANGLE / radius;
@@ -94,6 +212,12 @@ vec3 skyColor(vec3 dir, float blur) {
   float halo = exp(-ang * 2.2) * (0.13 + uMid * 0.17);
 
   col += MOON_TINT * (disc * 14.0 * spread * spread + bleed + halo);
+
+  // 雲。まず星と空を覆って沈め、そのうえで月に向いた面だけを照らす。
+  // 夜の雲は「明るいもの」ではなく「星を隠すもの」なので、順序がこうなる
+  float cloud = clouds(dir, blur);
+  col = mix(col, CLOUD_SHADE, cloud * 0.62);
+  col += CLOUD_LIT * cloud * exp(-ang * 1.3) * (0.55 + uMid * 0.75);
 
   // 水平線際の霞。空と水の境目を溶かして、切り取ったような硬さを消す
   float haze = exp(-max(dir.y, 0.0) * 22.0) * (0.05 + uMid * 0.05);
