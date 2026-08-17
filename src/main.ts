@@ -4,7 +4,7 @@ import { AudioEngine } from './audio/engine.ts'
 import { OnsetDetector } from './audio/onset.ts'
 import { probeTrack } from './audio/track.ts'
 import { silence, type Levels } from './core/levels.ts'
-import { GlWaterScene } from './scene/gl/glScene.ts'
+import { GlWaterScene, isSceneSupported } from './scene/gl/glScene.ts'
 
 /** 同梱の音源。無ければドロップで受け取る */
 const BUNDLED_TRACK = `${import.meta.env.BASE_URL}audio/introspection.mp3`
@@ -36,7 +36,10 @@ const fileInput = requireElement<HTMLInputElement>('#file')
 const status = requireElement<HTMLParagraphElement>('#status')
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-const scene = new GlWaterScene(stage, { reducedMotion })
+
+// 描けない端末では、黙って真っ暗な画面を見せるより、そう言った方がいい。
+// 音は鳴らせるので、再生そのものは残す
+const scene = isSceneSupported() ? new GlWaterScene(stage, { reducedMotion }) : null
 const engine = new AudioEngine()
 const onset = new OnsetDetector()
 
@@ -114,6 +117,7 @@ async function start(): Promise<void> {
   if (started) return
   started = true
   dismissOverlay()
+  if (!scene) showStatus('この端末では絵を描けません（WebGL2 が要ります）')
   // ここで初めて読み込みの結果を待つ。読めていなければ静かな水面のまま
   if (await bundledTrack) await playOrReport()
   updateToggleLabel()
@@ -242,14 +246,14 @@ function frame(nowMs: number): void {
 
   if (engine.playing) {
     const hit = onset.push(raw.low, nowMs)
-    if (hit !== null) scene.splash(hit, nowMs)
+    if (hit !== null) scene?.splash(hit, nowMs)
   } else if (nowMs >= nextIdleSplashMs) {
     // 無音でも水面は生きている。まばらに、弱く落とす
-    scene.splash(0.22 + Math.random() * 0.2, nowMs)
+    scene?.splash(0.22 + Math.random() * 0.2, nowMs)
     nextIdleSplashMs = nowMs + IDLE_SPLASH_INTERVAL_MS * (0.6 + Math.random() * 0.9)
   }
 
-  scene.draw(levels, nowMs)
+  scene?.draw(levels, nowMs)
   requestAnimationFrame(frame)
 }
 
@@ -258,14 +262,14 @@ requestAnimationFrame(frame)
 // ---- 画面まわり ------------------------------------------------------------
 
 // resize は連続で飛ぶ（モバイルの URL バー伸縮、ウィンドウのドラッグ）。
-// 1 フレームにひとつへ畳まないと、その都度キャンバスを 3 枚張り直すことになる
+// 1 フレームにひとつへ畳まないと、その都度キャンバスと描画用の面を張り直すことになる
 let resizePending = false
 window.addEventListener('resize', () => {
   if (resizePending) return
   resizePending = true
   requestAnimationFrame(() => {
     resizePending = false
-    scene.resize()
+    scene?.resize()
   })
 })
 

@@ -28,6 +28,36 @@ const MOON_UV_Y = 0.35
 const MAX_PIXEL_DENSITY = 2
 
 /**
+ * 描画の細かさの段階。重ければ上から順に落としていく。
+ *
+ * この絵の重さは、ほぼピクセル数に比例する（1 ピクセルごとに視線を飛ばし、
+ * 波を 9 枚重ね、空を 2 回引いている）。細かさを 2 から 1 へ落とすだけで
+ * 計算量は 1/4 になる。
+ */
+const DENSITY_STEPS = [2, 1.5, 1, 0.75]
+
+/** これより遅いフレームが続いたら、細かさを 1 段落とす(ms) */
+const SLOW_FRAME_MS = 30
+
+/** 落とすかどうかを決めるのに見るフレーム数 */
+const SAMPLE_FRAMES = 45
+
+/**
+ * この端末で描けるか。
+ *
+ * シェーダーを GLSL ES 3.00 で書いているので WebGL2 が要る。無い環境では
+ * シェーダーのコンパイルが通らず、画面が黙って真っ暗になる。
+ * 描き始める前に確かめて、伝えられるようにしておく。
+ */
+export function isSceneSupported(): boolean {
+  try {
+    return document.createElement('canvas').getContext('webgl2') !== null
+  } catch {
+    return false
+  }
+}
+
+/**
  * 水面からの目の高さ（ワールド単位）。
  *
  * 波の周期はワールド単位で決めてあるので、この値が「どれくらいの大きさの波を
@@ -78,6 +108,12 @@ export class GlWaterScene {
 
   private lastFrameMs: number | null = null
 
+  /** 落としていける細かさの段階。端末の DPI に合わせて先頭を決める */
+  private readonly densitySteps: number[]
+  private densityIndex = 0
+  /** 直近のフレーム時間(ms)。溜まったところで細かさを見直す */
+  private readonly frameSamples: number[] = []
+
   /**
    * 波の位相に使う時刻（秒）。
    *
@@ -94,6 +130,10 @@ export class GlWaterScene {
     this.random = options.random ?? Math.random
     this.motion = options.reducedMotion ? 0.3 : 1
 
+    const cap = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_DENSITY)
+    const steps = DENSITY_STEPS.filter((step) => step <= cap)
+    this.densitySteps = steps.length > 0 ? steps : [cap]
+
     this.instance = new p5((sketch: p5) => {
       sketch.setup = () => {
         const canvas = sketch.createCanvas(
@@ -103,7 +143,7 @@ export class GlWaterScene {
         )
         // 板を貼るだけなので、輪郭線は要らない
         sketch.noStroke()
-        sketch.pixelDensity(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_DENSITY))
+        sketch.pixelDensity(this.densitySteps[this.densityIndex])
 
         this.sceneShader = sketch.createShader(vertexSource, sceneSource)
         this.bloomShader = sketch.createShader(vertexSource, bloomSource)
@@ -138,11 +178,19 @@ export class GlWaterScene {
     if (next.width === width && next.height === height) return
     this.instance.resizeCanvas(next.width, next.height)
 
-    // シーン用は canvas に追従して自動で取り直されるが、粗い滲み用は
-    // 自前の大きさなので、こちらで合わせ直す
+    this.resizeBloomBuffer(next.width, next.height)
+  }
+
+  /**
+   * 滲み用の面を合わせ直す。
+   *
+   * シーン用はキャンバスに追従して自動で取り直されるが、こちらは自前の
+   * 大きさを持っているので、画面が変わった時に自分で伝える必要がある。
+   */
+  private resizeBloomBuffer(width: number, height: number): void {
     this.bloomBuffer?.resize(
-      Math.max(1, Math.ceil(next.width / BLOOM_DOWNSCALE)),
-      Math.max(1, Math.ceil(next.height / BLOOM_DOWNSCALE)),
+      Math.max(1, Math.ceil(width / BLOOM_DOWNSCALE)),
+      Math.max(1, Math.ceil(height / BLOOM_DOWNSCALE)),
     )
   }
 
@@ -174,9 +222,33 @@ export class GlWaterScene {
 
     this.ripples.prune(nowMs)
     this.packRipples(nowMs)
+    this.watchFrameCost(deltaMs)
 
     this.levels = levels
     this.instance.redraw()
+  }
+
+  /**
+   * 描くのが追いつかなくなったら、細かさを 1 段落とす。
+   *
+   * 中央値で見ているのは、たまに混じる大きな飛び（タブの切り替え、GC）に
+   * 引きずられないため。一度落としたら戻さない。境目のあたりで上げ下げを
+   * 繰り返すと、そのたびにキャンバスを作り直して余計に重くなる。
+   */
+  private watchFrameCost(deltaMs: number): void {
+    if (deltaMs <= 0 || this.densityIndex >= this.densitySteps.length - 1) return
+
+    this.frameSamples.push(deltaMs)
+    if (this.frameSamples.length < SAMPLE_FRAMES) return
+
+    const sorted = [...this.frameSamples].sort((a, b) => a - b)
+    const median = sorted[Math.floor(sorted.length / 2)]
+    this.frameSamples.length = 0
+
+    if (median <= SLOW_FRAME_MS) return
+    this.densityIndex++
+    this.instance.pixelDensity(this.densitySteps[this.densityIndex])
+    this.resizeBloomBuffer(this.instance.width, this.instance.height)
   }
 
   /**
