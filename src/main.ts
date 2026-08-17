@@ -1,7 +1,9 @@
 import './style.css'
-import { smooth, type Levels } from './audio/bands.ts'
+import { smooth } from './audio/bands.ts'
 import { AudioEngine } from './audio/engine.ts'
 import { OnsetDetector } from './audio/onset.ts'
+import { probeTrack } from './audio/track.ts'
+import { silence, type Levels } from './core/levels.ts'
 import { WaterScene } from './scene/waterScene.ts'
 
 /** 同梱の音源。無ければドロップで受け取る */
@@ -17,12 +19,13 @@ const overlayNote = requireElement<HTMLParagraphElement>('#overlay-note')
 const toggleButton = requireElement<HTMLButtonElement>('#toggle')
 const status = requireElement<HTMLParagraphElement>('#status')
 
-const scene = new WaterScene(canvas)
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+const scene = new WaterScene(canvas, { reducedMotion })
 const engine = new AudioEngine()
 const onset = new OnsetDetector()
 
 /** 生の解析値をならしたもの。これを画に渡す */
-const levels: Levels = { low: 0, mid: 0, high: 0 }
+const levels: Levels = silence()
 
 let trackReady = false
 let started = false
@@ -30,26 +33,26 @@ let nextIdleSplashMs = 0
 
 // ---- 起動 ------------------------------------------------------------------
 
-void (async () => {
-  trackReady = await engine.load(BUNDLED_TRACK)
-  if (trackReady) {
-    enterButton.textContent = '再生する'
-    overlayNote.textContent = 'Introspection — Mona Wonderlick'
-  } else {
-    enterButton.textContent = 'そのまま見る'
-    overlayNote.textContent =
-      '音源が見つかりません。mp3 をこの画面にドロップすると、その曲で水面が揺れます'
-  }
-  enterButton.disabled = false
-})()
+// 入口は読み込みを待たない。待たせると、音源が返ってこない回線で
+// 「準備中」のまま画面が二度と開かなくなる
+enterButton.disabled = false
+enterButton.textContent = 'はじめる'
+
+const bundledTrack = probeTrack(BUNDLED_TRACK).then((found) => {
+  if (found) engine.attach(BUNDLED_TRACK)
+  trackReady = found
+  overlayNote.textContent = found
+    ? 'Introspection — Mona Wonderlick'
+    : '音源が見つかりません。mp3 をこの画面にドロップすると、その曲で水面が揺れます'
+  updateToggleLabel()
+  return found
+})
 
 enterButton.addEventListener('click', () => {
   void start()
 })
 
-toggleButton.addEventListener('click', () => {
-  void engine.toggle().then(updateToggleLabel)
-})
+toggleButton.addEventListener('click', toggleAudio)
 
 window.addEventListener('keydown', (event) => {
   if (event.code !== 'Space') return
@@ -57,17 +60,40 @@ window.addEventListener('keydown', (event) => {
   if (document.activeElement instanceof HTMLButtonElement) return
   event.preventDefault()
   if (!started) void start()
-  else void engine.toggle().then(updateToggleLabel)
+  else toggleAudio()
 })
+
+// 音声グラフと objectURL を畳んでからページを離れる
+window.addEventListener('pagehide', () => engine.dispose())
 
 async function start(): Promise<void> {
   if (started) return
   started = true
   overlay.classList.add('is-hidden')
-  if (trackReady) {
-    await engine.play().catch(() => undefined)
-  }
+  // ここで初めて読み込みの結果を待つ。読めていなければ静かな水面のまま
+  if (await bundledTrack) await playOrReport()
   updateToggleLabel()
+}
+
+function toggleAudio(): void {
+  if (engine.playing) {
+    engine.pause()
+    updateToggleLabel()
+    return
+  }
+  void playOrReport().finally(updateToggleLabel)
+}
+
+/**
+ * play() は連打時の中断や自動再生の制限で普通に失敗する。
+ * 握り潰さず、失敗したことだけは伝える。
+ */
+async function playOrReport(): Promise<void> {
+  try {
+    await engine.play()
+  } catch {
+    showStatus('音を再生できませんでした')
+  }
 }
 
 // ---- 音源のドロップ --------------------------------------------------------
@@ -87,26 +113,25 @@ window.addEventListener('drop', (event) => {
   event.preventDefault()
   document.body.classList.remove('is-dropping')
   const file = event.dataTransfer?.files?.[0]
-  if (!file) return
-  if (!file.type.startsWith('audio/')) {
-    showStatus('音声ファイルを渡してください')
-    return
-  }
-  void adoptFile(file)
+  if (file) void adoptFile(file)
 })
 
+/**
+ * 拡張子や MIME で弾かない。type が空になる形式（環境によっては .flac や
+ * .opus）があるので、鳴らせるかどうかは実際に再生してみて決める。
+ */
 async function adoptFile(file: File): Promise<void> {
-  const ok = await engine.load(file)
-  if (!ok) {
-    showStatus('この形式は読み込めませんでした')
-    return
-  }
+  engine.attach(file)
   trackReady = true
   started = true
   overlay.classList.add('is-hidden')
-  await engine.play().catch(() => undefined)
+  try {
+    await engine.play()
+    showStatus(engine.sourceLabel ?? '')
+  } catch {
+    showStatus('この音源は再生できませんでした')
+  }
   updateToggleLabel()
-  showStatus(`▶ ${engine.sourceLabel ?? ''}`)
 }
 
 // ---- 毎フレーム ------------------------------------------------------------
@@ -135,7 +160,17 @@ requestAnimationFrame(frame)
 
 // ---- 画面まわり ------------------------------------------------------------
 
-window.addEventListener('resize', () => scene.resize())
+// resize は連続で飛ぶ（モバイルの URL バー伸縮、ウィンドウのドラッグ）。
+// 1 フレームにひとつへ畳まないと、その都度キャンバスを 3 枚張り直すことになる
+let resizePending = false
+window.addEventListener('resize', () => {
+  if (resizePending) return
+  resizePending = true
+  requestAnimationFrame(() => {
+    resizePending = false
+    scene.resize()
+  })
+})
 
 function updateToggleLabel(): void {
   toggleButton.hidden = !trackReady

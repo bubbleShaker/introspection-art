@@ -1,22 +1,22 @@
-import { BAND_HZ, bandLevel, binRange, type BinRange, type Levels } from './bands.ts'
+import { silence, type Levels } from '../core/levels.ts'
+import { BandAnalyser } from './bandAnalyser.ts'
 
 /**
- * 音源の再生と解析をまとめて持つ。
+ * 音源の再生を受け持つ。解析そのものは BandAnalyser に任せる。
  *
  * <audio> 要素を噛ませているのは、mp3 全体をメモリに展開せずに
  * 流し始められること、ループや一時停止をブラウザ任せにできることによる。
  * その音を MediaElementAudioSourceNode で Web Audio 側に引き込み、
- * AnalyserNode を通してからスピーカーへ返す。
+ * 解析ノードを通してからスピーカーへ返す。
  *
  *   <audio> → MediaElementSource → Analyser → destination
  */
 export class AudioEngine {
   private readonly element: HTMLAudioElement
   private context: AudioContext | null = null
-  private analyser: AnalyserNode | null = null
-  private freqData: Uint8Array<ArrayBuffer> = new Uint8Array(0)
-  private ranges: Record<keyof Levels, BinRange> | null = null
+  private analyser: BandAnalyser | null = null
   private objectUrl: string | null = null
+  private label: string | null = null
 
   constructor() {
     this.element = new Audio()
@@ -30,36 +30,28 @@ export class AudioEngine {
   }
 
   /** 今読み込まれている音源の表示名（無ければ null） */
-  sourceLabel: string | null = null
+  get sourceLabel(): string | null {
+    return this.label
+  }
 
   /**
-   * 音源を差し替える。URL でも、ドロップされた File でもよい。
-   * 読み込めたかどうかを返し、呼び出し側が表示を切り替えられるようにする。
+   * 音源を繋ぐ。URL でも、ドロップされた File でもよい。
+   *
+   * 読み込みの完了は待たない。待つ設計にすると、遅い回線でその間ずっと
+   * 画面を止めることになり、しかも「読めたか」の判定を誤りやすい。
+   * 実際に鳴らせるかどうかは play() が投げるかどうかで分かる。
    */
-  async load(source: string | File): Promise<boolean> {
+  attach(source: string | File): void {
     this.revokeObjectUrl()
 
     if (typeof source === 'string') {
       this.element.src = source
-      this.sourceLabel = source.split('/').pop() ?? source
+      this.label = source.split('/').pop() ?? source
     } else {
       this.objectUrl = URL.createObjectURL(source)
       this.element.src = this.objectUrl
-      this.sourceLabel = source.name
+      this.label = source.name
     }
-
-    return await new Promise<boolean>((resolve) => {
-      const done = (ok: boolean) => {
-        this.element.removeEventListener('canplay', onReady)
-        this.element.removeEventListener('error', onError)
-        resolve(ok)
-      }
-      const onReady = () => done(true)
-      const onError = () => done(false)
-      this.element.addEventListener('canplay', onReady, { once: true })
-      this.element.addEventListener('error', onError, { once: true })
-      this.element.load()
-    })
   }
 
   /**
@@ -83,48 +75,40 @@ export class AudioEngine {
 
   /** 現在の帯域ごとの強さ。解析器が無い／止まっている間はすべて 0 */
   levels(): Levels {
-    if (!this.analyser || !this.ranges || !this.playing) {
-      return { low: 0, mid: 0, high: 0 }
-    }
-    this.analyser.getByteFrequencyData(this.freqData)
-    return {
-      low: bandLevel(this.freqData, this.ranges.low),
-      mid: bandLevel(this.freqData, this.ranges.mid),
-      high: bandLevel(this.freqData, this.ranges.high),
-    }
+    if (!this.analyser || !this.playing) return silence()
+    return this.analyser.read()
   }
 
+  /**
+   * 後始末。ページを離れる時に呼ぶ。
+   *
+   * これを呼んだ engine は作り直すしかない。MediaElementSource は
+   * ひとつの <audio> に対して一度しか作れないためで、配線し直しはできない。
+   * 参照を落としているのは、閉じたコンテキストが残っていると play() が
+   * 配線済みと勘違いして無音のまま再生してしまうのを防ぐため。
+   */
   dispose(): void {
     this.pause()
     this.revokeObjectUrl()
-    void this.context?.close()
+    const context = this.context
+    this.context = null
+    this.analyser = null
+    void context?.close()
   }
 
   private ensureGraph(): void {
     if (this.context) return
 
     const context = new AudioContext()
-    const analyser = context.createAnalyser()
-    // 2048 だと約 21Hz 刻み。低域を数ビンに分けられる程度には細かく、
-    // 毎フレーム走査しても重くない大きさ
-    analyser.fftSize = 2048
-    // AnalyserNode 自身も前フレームと混ぜてくれる。ここで軽く効かせておくと
-    // 描画側の平滑化が薄くて済む
-    analyser.smoothingTimeConstant = 0.75
+    const analyser = new BandAnalyser(context)
 
     // MediaElementSource は同じ要素に対して一度しか作れない。
     // context ごと使い回すので、ここが唯一の生成箇所になる
-    context.createMediaElementSource(this.element).connect(analyser)
-    analyser.connect(context.destination)
+    context.createMediaElementSource(this.element).connect(analyser.node)
+    analyser.node.connect(context.destination)
 
     this.context = context
     this.analyser = analyser
-    this.freqData = new Uint8Array(analyser.frequencyBinCount)
-    this.ranges = {
-      low: binRange(BAND_HZ.low[0], BAND_HZ.low[1], context.sampleRate, analyser.fftSize),
-      mid: binRange(BAND_HZ.mid[0], BAND_HZ.mid[1], context.sampleRate, analyser.fftSize),
-      high: binRange(BAND_HZ.high[0], BAND_HZ.high[1], context.sampleRate, analyser.fftSize),
-    }
   }
 
   private revokeObjectUrl(): void {

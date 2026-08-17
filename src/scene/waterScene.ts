@@ -1,4 +1,4 @@
-import type { Levels } from '../audio/bands.ts'
+import type { Levels } from '../core/levels.ts'
 import { PALETTE, TRANSPARENT } from './palette.ts'
 import { advanceParticles, particleBrightness, seedParticles, type Particle } from './particles.ts'
 import { progress, opacityRatio, radiusRatio, RippleField } from './ripples.ts'
@@ -21,8 +21,14 @@ import { progress, opacityRatio, radiusRatio, RippleField } from './ripples.ts'
 /** 水平線の高さ（画面高に対する比）。空を少なめにして水に語らせる */
 const HORIZON_RATIO = 0.42
 
-/** 反射の縦の詰まり具合。1 未満だと遠近がついて奥行きが出る */
-const REFLECTION_COMPRESS = 0.94
+/**
+ * 反射の縦の伸び。
+ *
+ * 水面を 1px 下がるごとに、写す空を何 px 遡るか。1 より小さいと空の遡りが
+ * 遅れるぶん、反射像は縦に引き伸ばされる。点光源の反射が縦に長く伸びるのは
+ * 実際の水面でも起きることで、これが奥行きを出す。
+ */
+const REFLECTION_STRETCH = 0.94
 
 /**
  * 転写するスライスの高さ(デバイス px)。
@@ -59,7 +65,23 @@ export class WaterScene {
 
   private lastFrameMs: number | null = null
 
-  constructor(canvas: HTMLCanvasElement, random: () => number = Math.random) {
+  /**
+   * きらめきの位相。
+   *
+   * 速さが音で変わるものは、時刻に係数を掛けてはいけない。sin(t * k) の k を
+   * 動かすと、t が大きいほど位相が飛び、数分後にはただのノイズになる。
+   * 毎フレームぶんだけ足して積み上げれば、速さを変えても位相は連続する。
+   */
+  private shimmerPhase = 0
+
+  /** 動きの控えめさ。動きを減らす設定の人には小さくする */
+  private readonly motion: number
+
+  constructor(
+    canvas: HTMLCanvasElement,
+    options: { random?: () => number; reducedMotion?: boolean } = {},
+  ) {
+    const random = options.random ?? Math.random
     const ctx = canvas.getContext('2d')
     const sky = document.createElement('canvas')
     const skyCtx = sky.getContext('2d')
@@ -74,6 +96,7 @@ export class WaterScene {
     this.mirror = mirror
     this.mirrorCtx = mirrorCtx
     this.random = random
+    this.motion = options.reducedMotion ? 0.3 : 1
     this.particles = seedParticles(180, random)
     this.resize()
   }
@@ -117,11 +140,16 @@ export class WaterScene {
 
   /** 1 フレーム描く */
   draw(levels: Levels, nowMs: number): void {
-    const deltaSeconds = this.lastFrameMs === null ? 0 : (nowMs - this.lastFrameMs) / 1000
+    // タブが裏に回っていた等で大きく飛んだ時は、進める時間を頭打ちにする
+    // （そのまま使うと粒が瞬間移動し、位相も飛ぶ）
+    const deltaMs =
+      this.lastFrameMs === null ? 0 : Math.min(nowMs - this.lastFrameMs, 100)
     this.lastFrameMs = nowMs
-    // タブが裏に回っていた等で大きく飛んだ時は動かさない（粒が瞬間移動する）
-    advanceParticles(this.particles, Math.min(deltaSeconds, 0.1))
+    advanceParticles(this.particles, deltaMs / 1000)
     this.ripples.prune(nowMs)
+
+    // 高域が強いほどきらめきが速くなる
+    this.shimmerPhase += deltaMs * 0.005 * (0.6 + levels.high * 1.4) * this.motion
 
     this.moonX = 0.5 + Math.sin(nowMs * 0.00004) * 0.07
 
@@ -264,14 +292,14 @@ export class WaterScene {
 
     const slice = SLICE_PX
     // 低域が来るとうねりが大きくなる。無音でも 0.4 は残して水を死なせない
-    const swell = 0.4 + levels.low * 1.6
+    const swell = (0.4 + levels.low * 1.6) * this.motion
     // ずらした分だけ端に隙間ができるので、あらかじめ横に伸ばして描く
     const overscan = this.unit * 150
 
     ctx.globalCompositeOperation = 'lighter'
 
     for (let d = 0; d < waterHeight; d += slice) {
-      const srcTop = this.horizonY - (d + slice) * REFLECTION_COMPRESS
+      const srcTop = this.horizonY - (d + slice) * REFLECTION_STRETCH
       if (srcTop < 0) break
 
       const depth = d / waterHeight
@@ -289,11 +317,13 @@ export class WaterScene {
 
       // 反射は元の光景より暗い。粒の写り込みは薄く沈み、月だけが残る
       ctx.globalAlpha = Math.min(1, 0.62 * (1 - depth) ** 1.1 + 0.04)
-      // 反射元は半分の解像度なので、切り出す座標も半分にする
+      // 反射元は半分の解像度なので、切り出す座標も半分にする。
+      // 端数の切り上げで縦にわずかにはみ出しうるので、そこで止める
+      const mirrorTop = Math.min(srcTop / 2, this.mirror.height - slice / 2)
       ctx.drawImage(
         this.mirror,
         0,
-        srcTop / 2,
+        mirrorTop,
         this.mirror.width,
         slice / 2,
         offsetX - overscan,
@@ -323,8 +353,7 @@ export class WaterScene {
 
     const cx = this.moonX * this.width
     const step = Math.max(2, Math.round(3 * this.dpr))
-    const sway = 0.55 + levels.low * 0.85 // 低域で柱が乱れる
-    const shimmer = 0.6 + levels.high * 1.4 // 高域できらめきが速くなる
+    const sway = (0.55 + levels.low * 0.85) * this.motion // 低域で柱が乱れる
     const glow = 0.75 + levels.mid * 0.7 // 中域で全体が明るむ
 
     ctx.globalCompositeOperation = 'lighter'
@@ -359,7 +388,7 @@ export class WaterScene {
         const ratio = Math.min(1, Math.abs(offset) / halfWidth)
         const spread = 1 - ratio * ratio
         // 3 乗して、光っている瞬間を尖らせる。常時光っていると水に見えない
-        const twinkle = Math.max(0, Math.sin(seed * 0.9 + nowMs * 0.005 * shimmer)) ** 3
+        const twinkle = Math.max(0, Math.sin(seed * 0.9 + this.shimmerPhase)) ** 3
         const alpha = falloff * spread * twinkle * glow * 1.4
         if (alpha <= 0.004) continue
 

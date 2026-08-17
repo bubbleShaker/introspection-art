@@ -48,9 +48,6 @@ export function bandLevel(freqData: Uint8Array, range: BinRange): number {
   return sum / (to - from) / 255
 }
 
-/** 画に効かせる三つの値。すべて 0..1 */
-export type Levels = { low: number; mid: number; high: number }
-
 /** 帯域の切り方。低域は波紋、中域は明るさ、高域はきらめきに効かせる */
 export const BAND_HZ = {
   low: [20, 160],
