@@ -40,6 +40,10 @@ const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matc
 // 描けない端末では、黙って真っ暗な画面を見せるより、そう言った方がいい。
 // 音は鳴らせるので、再生そのものは残す
 const scene = isSceneSupported() ? new GlWaterScene(stage, { reducedMotion }) : null
+
+// WebGL2 が在っても、シェーダーが組み立てられないことはある（uniform の本数、
+// 精度）。そちらは最初に描く時まで分からないので、後からでも伝えられるようにする
+if (scene) scene.onError = (message) => showStatus(message)
 const engine = new AudioEngine()
 const onset = new OnsetDetector()
 
@@ -110,8 +114,11 @@ window.addEventListener('keydown', (event) => {
 // その時もボタンの表示を合わせる
 engine.onChange = () => updateToggleLabel()
 
-// 音声グラフと objectURL を畳んでからページを離れる
-window.addEventListener('pagehide', () => engine.dispose())
+// 音声グラフと objectURL、そして GPU 側の資源を畳んでからページを離れる
+window.addEventListener('pagehide', () => {
+  engine.dispose()
+  scene?.dispose()
+})
 
 async function start(): Promise<void> {
   if (started) return

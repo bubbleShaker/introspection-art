@@ -1,6 +1,8 @@
 import p5 from 'p5'
 import type { Levels } from '../../core/levels.ts'
 import { opacityRatio, progress, radiusRatio, RippleField } from '../ripples.ts'
+import { EYE_HEIGHT, HORIZON_UV, moonDirection, waterPointAt } from './camera.ts'
+import { QualityGovernor } from './quality.ts'
 import bloomSource from './shaders/bloom.frag.glsl?raw'
 import compositeSource from './shaders/composite.frag.glsl?raw'
 import sceneSource from './shaders/scene.frag.glsl?raw'
@@ -18,53 +20,6 @@ import vertexSource from './shaders/scene.vert.glsl?raw'
  * 音のスムージングと打点検出は今までどおり main.ts 側に残る。
  */
 
-/** 水平線の高さ。uv 系（画面中央が 0、上が正、縦の半分で 0.5） */
-const HORIZON_UV = 0.08
-
-/** 月の高さ。同じく uv 系 */
-const MOON_UV_Y = 0.35
-
-/** 高 DPI で素直に倍率を上げると、ピクセルごとの計算量が跳ねる。2 で頭打ちにする */
-const MAX_PIXEL_DENSITY = 2
-
-/**
- * 描画の細かさの段階。重ければ上から順に落としていく。
- *
- * この絵の重さは、ほぼピクセル数に比例する（1 ピクセルごとに視線を飛ばし、
- * 波を 9 枚重ね、空を 2 回引いている）。細かさを 2 から 1 へ落とすだけで
- * 計算量は 1/4 になる。
- */
-const DENSITY_STEPS = [2, 1.5, 1, 0.75]
-
-/** これより遅いフレームが続いたら、細かさを 1 段落とす(ms) */
-const SLOW_FRAME_MS = 30
-
-/** 落とすかどうかを決めるのに見るフレーム数 */
-const SAMPLE_FRAMES = 45
-
-/**
- * この端末で描けるか。
- *
- * シェーダーを GLSL ES 3.00 で書いているので WebGL2 が要る。無い環境では
- * シェーダーのコンパイルが通らず、画面が黙って真っ暗になる。
- * 描き始める前に確かめて、伝えられるようにしておく。
- */
-export function isSceneSupported(): boolean {
-  try {
-    return document.createElement('canvas').getContext('webgl2') !== null
-  } catch {
-    return false
-  }
-}
-
-/**
- * 水面からの目の高さ（ワールド単位）。
- *
- * 波の周期はワールド単位で決めてあるので、この値が「どれくらいの大きさの波を
- * 見ているか」の基準になる。シェーダーへは uniform で渡すので、定義はここだけ。
- */
-const EYE_HEIGHT = 1.0
-
 /** シェーダーが一度に受け取れる波紋の数。scene.frag.glsl の MAX_RIPPLES と揃える */
 const MAX_RIPPLES = 12
 
@@ -74,18 +29,51 @@ const RIPPLE_MAX_RADIUS = 0.85
 /**
  * 滲みを作る面の粗さ。1 が原寸で、2 なら縦横それぞれ半分。
  *
- * ぼかした結果しか使わないので粗くてよく、粗いほど拾う画素の間隔を
- * 広く取れる（＝同じ点数で広く滲む）。描く面積も 1/4 で済む。
+ * ぼかした結果しか使わないので粗くてよく、描く面積が 1/4 で済む。
  */
 const BLOOM_DOWNSCALE = 2
 
-/** 滲みをどれくらい広げるか（滲み面の画素数） */
+/** 滲みをどれくらい広げるか（元絵の画素数） */
 const BLOOM_RADIUS = 26
 
+/**
+ * この端末で描けるか。
+ *
+ * シェーダーを GLSL ES 3.00 で書いているので WebGL2 が要る。無い環境では
+ * シェーダーのコンパイルが通らず、画面が黙って真っ暗になる。
+ * 描き始める前に確かめて、伝えられるようにしておく。
+ *
+ * ただしこれは足切りでしかない。uniform の本数や精度など、このシェーダー
+ * 固有の理由で落ちることもあるので、描く側でも失敗を拾う（onError）。
+ */
+export function isSceneSupported(): boolean {
+  try {
+    const canvas = document.createElement('canvas')
+    const gl = canvas.getContext('webgl2')
+    if (gl === null) return false
+    // 確かめるためだけに取ったコンテキスト。同時に持てる数には上限があるので返す
+    gl.getExtension('WEBGL_lose_context')?.loseContext()
+    return true
+  } catch {
+    return false
+  }
+}
+
 export class GlWaterScene {
+  /**
+   * 描けなくなった時に一度だけ呼ばれる。
+   *
+   * シェーダーのコンパイルは、キャンバスができてから最初に描く時まで走らない。
+   * つまり「起動には成功したが描けない」があり得る。黙って真っ暗のままに
+   * しないための出口。
+   */
+  onError: ((message: string) => void) | null = null
+
   private readonly instance: p5
+  private readonly container: HTMLElement
   private readonly motion: number
   private readonly random: () => number
+  private readonly quality: QualityGovernor
 
   private sceneShader: p5.Shader | null = null
   private bloomShader: p5.Shader | null = null
@@ -96,7 +84,14 @@ export class GlWaterScene {
   /** 明るいところだけを集めてぼかした面。原寸より粗い */
   private bloomBuffer: p5.Framebuffer | null = null
 
-  private levels: Levels = { low: 0, mid: 0, high: 0 }
+  /**
+   * 描く時に読む音の強さ。
+   *
+   * 呼び出し側から渡されたオブジェクトを持たずに、値を写している。
+   * 向こうは毎フレーム同じオブジェクトを書き換えて使い回しているので、
+   * 参照で持つと「いつ読むか」に絵が左右される。
+   */
+  private readonly levels: Levels = { low: 0, mid: 0, high: 0 }
 
   private readonly ripples = new RippleField()
   /** 波紋をシェーダーへ渡すための入れ物。毎フレーム作り直さず、詰め替える */
@@ -107,12 +102,9 @@ export class GlWaterScene {
   private moonX = 0.5
 
   private lastFrameMs: number | null = null
-
-  /** 落としていける細かさの段階。端末の DPI に合わせて先頭を決める */
-  private readonly densitySteps: number[]
-  private densityIndex = 0
-  /** 直近のフレーム時間(ms)。溜まったところで細かさを見直す */
-  private readonly frameSamples: number[] = []
+  /** 一度描けなくなったら、それ以上は試さない */
+  private broken = false
+  private disposed = false
 
   /**
    * 波の位相に使う時刻（秒）。
@@ -123,36 +115,39 @@ export class GlWaterScene {
    */
   private time = 0
 
+  /** 月が漂った量（秒）。時刻に係数を掛けないのは上と同じ理由 */
+  private moonDrift = 0
+
   constructor(
     container: HTMLElement,
     options: { random?: () => number; reducedMotion?: boolean } = {},
   ) {
+    this.container = container
     this.random = options.random ?? Math.random
     this.motion = options.reducedMotion ? 0.3 : 1
-
-    const cap = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_DENSITY)
-    const steps = DENSITY_STEPS.filter((step) => step <= cap)
-    this.densitySteps = steps.length > 0 ? steps : [cap]
+    this.quality = new QualityGovernor(window.devicePixelRatio || 1)
 
     this.instance = new p5((sketch: p5) => {
       sketch.setup = () => {
-        const canvas = sketch.createCanvas(
-          container.clientWidth || window.innerWidth,
-          container.clientHeight || window.innerHeight,
-          sketch.WEBGL,
-        )
+        const size = this.viewportSize()
+        const canvas = sketch.createCanvas(size.width, size.height, sketch.WEBGL)
         // 板を貼るだけなので、輪郭線は要らない
         sketch.noStroke()
-        sketch.pixelDensity(this.densitySteps[this.densityIndex])
+        sketch.pixelDensity(this.quality.density)
 
         this.sceneShader = sketch.createShader(vertexSource, sceneSource)
         this.bloomShader = sketch.createShader(vertexSource, bloomSource)
         this.compositeShader = sketch.createShader(vertexSource, compositeSource)
 
-        this.sceneBuffer = sketch.createFramebuffer()
+        // 全面の板 1 枚しか描かないので、深度も MSAA も要らない。
+        // Safari は antialias の既定が true なので、黙っていると
+        // マルチサンプルの解決ぶんだけ損をする（しかも density を
+        // 落とす必要が出るのは、まさにその手の端末）
+        const options = { antialias: false, depth: false } as const
+        this.sceneBuffer = sketch.createFramebuffer(options)
         this.bloomBuffer = sketch.createFramebuffer({
-          width: Math.max(1, Math.ceil(sketch.width / BLOOM_DOWNSCALE)),
-          height: Math.max(1, Math.ceil(sketch.height / BLOOM_DOWNSCALE)),
+          ...options,
+          ...this.bloomSize(sketch.width, sketch.height),
         })
 
         // 音に反応する絵そのものは、支援技術には読めない。何が映っているかを
@@ -167,31 +162,25 @@ export class GlWaterScene {
     }, container)
   }
 
-  /** 表示サイズに合わせてキャンバスを取り直す */
-  resize(): void {
-    const width = this.instance.width
-    const height = this.instance.height
-    const next = {
-      width: window.innerWidth,
-      height: window.innerHeight,
+  /** 置き場所の大きさ。生成時とリサイズ時で基準を揃える */
+  private viewportSize(): { width: number; height: number } {
+    return {
+      width: this.container.clientWidth || window.innerWidth,
+      height: this.container.clientHeight || window.innerHeight,
     }
-    if (next.width === width && next.height === height) return
-    this.instance.resizeCanvas(next.width, next.height)
-
-    this.resizeBloomBuffer(next.width, next.height)
   }
 
-  /**
-   * 滲み用の面を合わせ直す。
-   *
-   * シーン用はキャンバスに追従して自動で取り直されるが、こちらは自前の
-   * 大きさを持っているので、画面が変わった時に自分で伝える必要がある。
-   */
-  private resizeBloomBuffer(width: number, height: number): void {
-    this.bloomBuffer?.resize(
-      Math.max(1, Math.ceil(width / BLOOM_DOWNSCALE)),
-      Math.max(1, Math.ceil(height / BLOOM_DOWNSCALE)),
-    )
+  /** 表示サイズに合わせてキャンバスを取り直す */
+  resize(): void {
+    if (this.disposed) return
+
+    const { width, height } = this.viewportSize()
+    if (width === this.instance.width && height === this.instance.height) return
+
+    // 第 3 引数の true は「今すぐ描き直さなくてよい」の意味。省くと p5 が
+    // ここで 1 回描いてしまい、直後の draw() と合わせて 3 パスを二重に走らせる
+    this.instance.resizeCanvas(width, height, true)
+    this.syncBloomBuffer(width, height)
   }
 
   /**
@@ -211,44 +200,74 @@ export class GlWaterScene {
 
   /** 1 フレーム描く */
   draw(levels: Levels, nowMs: number): void {
+    if (this.broken || this.disposed) return
+
     // タブが裏に回っていた等で大きく飛んだ時は、進める時間を頭打ちにする
     // （そのまま使うと波の位相が飛ぶ）
     const deltaMs = this.lastFrameMs === null ? 0 : Math.min(nowMs - this.lastFrameMs, 100)
     this.lastFrameMs = nowMs
+    const deltaSec = (deltaMs / 1000) * this.motion
 
     // 高域が強いほど水面のきらめきが速くなる
-    this.time += (deltaMs / 1000) * (0.6 + levels.high * 1.4) * this.motion
-    this.moonX = 0.5 + Math.sin(nowMs * 0.00004) * 0.07
+    this.time += deltaSec * (0.6 + levels.high * 1.4)
+    this.moonDrift += deltaSec
+    this.moonX = 0.5 + Math.sin(this.moonDrift * 0.04) * 0.07
 
     this.ripples.prune(nowMs)
     this.packRipples(nowMs)
-    this.watchFrameCost(deltaMs)
+    this.applyQuality(deltaMs)
 
-    this.levels = levels
-    this.instance.redraw()
+    this.levels.low = levels.low
+    this.levels.mid = levels.mid
+    this.levels.high = levels.high
+
+    // p5 2.x の redraw は async。中で投げられたものは reject として出てくるので、
+    // ここでも拾わないと unhandled rejection が毎フレーム積み上がる
+    void Promise.resolve(this.instance.redraw()).catch((error: unknown) => this.fail(error))
   }
 
   /**
-   * 描くのが追いつかなくなったら、細かさを 1 段落とす。
+   * p5 と、それが握っている GPU 側の資源を畳む。
    *
-   * 中央値で見ているのは、たまに混じる大きな飛び（タブの切り替え、GC）に
-   * 引きずられないため。一度落としたら戻さない。境目のあたりで上げ下げを
-   * 繰り返すと、そのたびにキャンバスを作り直して余計に重くなる。
+   * ページを離れる時はブラウザが片付けるので実害は薄いが、開発中の
+   * ホットリロードでは main.ts が何度も走り、そのたびに WebGL の
+   * コンテキストが積み上がる（同時に持てる数には上限がある）。
    */
-  private watchFrameCost(deltaMs: number): void {
-    if (deltaMs <= 0 || this.densityIndex >= this.densitySteps.length - 1) return
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.instance.remove()
+  }
 
-    this.frameSamples.push(deltaMs)
-    if (this.frameSamples.length < SAMPLE_FRAMES) return
+  /** 描くのが追いつかなくなっていたら、絵の細かさを 1 段落とす */
+  private applyQuality(deltaMs: number): void {
+    const density = this.quality.sample(deltaMs)
+    if (density === null) return
+    this.instance.pixelDensity(density)
+    this.syncBloomBuffer(this.instance.width, this.instance.height)
+  }
 
-    const sorted = [...this.frameSamples].sort((a, b) => a - b)
-    const median = sorted[Math.floor(sorted.length / 2)]
-    this.frameSamples.length = 0
+  private bloomSize(width: number, height: number): { width: number; height: number } {
+    return {
+      width: Math.max(1, Math.ceil(width / BLOOM_DOWNSCALE)),
+      height: Math.max(1, Math.ceil(height / BLOOM_DOWNSCALE)),
+    }
+  }
 
-    if (median <= SLOW_FRAME_MS) return
-    this.densityIndex++
-    this.instance.pixelDensity(this.densitySteps[this.densityIndex])
-    this.resizeBloomBuffer(this.instance.width, this.instance.height)
+  /**
+   * 滲み用の面を合わせ直す。
+   *
+   * シーン用は大きさを指定していないのでキャンバスに自動で追従するが、
+   * こちらは自前の大きさを持つぶん自動追従から外れる。**細かさ（density）も
+   * 外れる**ので、そちらも一緒に伝える。忘れると、画質を落としたのに
+   * 滲みだけ元の細かさで走り続け、しかも滲みの見かけの太さが変わる。
+   */
+  private syncBloomBuffer(width: number, height: number): void {
+    const buffer = this.bloomBuffer
+    if (!buffer) return
+    const size = this.bloomSize(width, height)
+    buffer.pixelDensity(this.quality.density)
+    buffer.resize(size.width, size.height)
   }
 
   /**
@@ -271,17 +290,18 @@ export class GlWaterScene {
       const amplitude = opacityRatio(t) * ripple.strength
       if (amplitude <= 0.002) continue
 
-      // 画面の (x, depth) を水面上の位置へ。視線と水面の交点を解くと、
-      // 距離は depth に反比例する（手前ほど近い）
-      const distance = EYE_HEIGHT / (Math.max(ripple.depth, 0.04) * (HORIZON_UV + 0.5))
+      const point = waterPointAt(ripple.x, ripple.depth, aspect)
       const offset = 4 * count
 
-      this.rippleBuffer[offset] = (ripple.x - 0.5) * aspect * distance
-      this.rippleBuffer[offset + 1] = -distance
-      // 遠くの波紋も見えるように、距離ぶんだけ大きさを持ち上げる。
+      this.rippleBuffer[offset] = point.x
+      this.rippleBuffer[offset + 1] = point.z
+      // 遠くの波紋も見えるように、隔たりぶんだけ大きさを持ち上げる。
       // 実際の水面では遠い輪ほど小さく見えるが、それだと打点が届かない
       this.rippleBuffer[offset + 2] =
-        radiusRatio(t) * RIPPLE_MAX_RADIUS * (0.6 + ripple.strength * 0.8) * (1 + distance * 0.16)
+        radiusRatio(t) *
+        RIPPLE_MAX_RADIUS *
+        (0.6 + ripple.strength * 0.8) *
+        (1 + point.forward * 0.16)
       this.rippleBuffer[offset + 3] = amplitude
 
       count++
@@ -306,63 +326,60 @@ export class GlWaterScene {
     const composite = this.compositeShader
     const sceneBuffer = this.sceneBuffer
     const bloomBuffer = this.bloomBuffer
-    if (!scene || !bloom || !composite || !sceneBuffer || !bloomBuffer) return
+    if (this.broken || !scene || !bloom || !composite || !sceneBuffer || !bloomBuffer) return
 
-    const density = sketch.pixelDensity()
+    // シェーダーが実際に組み立てられるのはここ。落ちるならこの中で落ちる
+    try {
+      const density = sketch.pixelDensity()
 
-    sceneBuffer.begin()
-    sketch.shader(scene)
-    scene.setUniform('uResolution', [sketch.width * density, sketch.height * density])
-    scene.setUniform('uTime', this.time)
-    scene.setUniform('uLow', this.levels.low)
-    scene.setUniform('uMid', this.levels.mid)
-    scene.setUniform('uHigh', this.levels.high)
-    scene.setUniform('uHorizon', HORIZON_UV)
-    scene.setUniform('uMotion', this.motion)
-    scene.setUniform('uEyeHeight', EYE_HEIGHT)
-    scene.setUniform('uRipples', this.rippleBuffer)
-    scene.setUniform('uRippleCount', this.rippleCount)
-    scene.setUniform('uMoonDir', this.moonDirection(sketch.width / sketch.height))
-    this.fill(sketch, sceneBuffer.width, sceneBuffer.height)
-    sceneBuffer.end()
+      sceneBuffer.begin()
+      sketch.shader(scene)
+      scene.setUniform('uResolution', [sketch.width * density, sketch.height * density])
+      scene.setUniform('uTime', this.time)
+      scene.setUniform('uLow', this.levels.low)
+      scene.setUniform('uMid', this.levels.mid)
+      scene.setUniform('uHigh', this.levels.high)
+      scene.setUniform('uHorizon', HORIZON_UV)
+      scene.setUniform('uMotion', this.motion)
+      scene.setUniform('uEyeHeight', EYE_HEIGHT)
+      scene.setUniform('uRipples', this.rippleBuffer)
+      scene.setUniform('uRippleCount', this.rippleCount)
+      scene.setUniform('uMoonDir', moonDirection(this.moonX, this.aspect()))
+      // ここだけ板をわずかに広げる。この段は gl_FragCoord から座標を作るので
+      // はみ出しても絵はずれず、丸め誤差で端に隙間ができるのだけを防げる
+      sketch.plane(sceneBuffer.width * 1.02, sceneBuffer.height * 1.02)
+      sceneBuffer.end()
 
-    bloomBuffer.begin()
-    sketch.shader(bloom)
-    bloom.setUniform('uScene', sceneBuffer)
-    bloom.setUniform('uRadius', BLOOM_RADIUS)
-    this.fill(sketch, bloomBuffer.width, bloomBuffer.height)
-    bloomBuffer.end()
+      bloomBuffer.begin()
+      sketch.shader(bloom)
+      bloom.setUniform('uScene', sceneBuffer)
+      bloom.setUniform('uRadius', BLOOM_RADIUS)
+      // 以降の段は texCoord でテクスチャを読む。板を広げると読む位置まで
+      // 一緒に広がって絵が拡大されるので、ここは寸法どおりに張る
+      sketch.plane(bloomBuffer.width, bloomBuffer.height)
+      bloomBuffer.end()
 
-    sketch.shader(composite)
-    composite.setUniform('uScene', sceneBuffer)
-    composite.setUniform('uBloom', bloomBuffer)
-    // 中域が厚いほど光が溢れる
-    composite.setUniform('uBloomStrength', 0.55 + this.levels.mid * 0.8)
-    this.fill(sketch, sketch.width, sketch.height)
+      sketch.shader(composite)
+      composite.setUniform('uScene', sceneBuffer)
+      composite.setUniform('uBloom', bloomBuffer)
+      // 中域が厚いほど光が溢れる
+      composite.setUniform('uBloomStrength', 0.55 + this.levels.mid * 0.8)
+      sketch.plane(sketch.width, sketch.height)
+    } catch (error) {
+      this.fail(error)
+    }
   }
 
-  /**
-   * 描き先いっぱいに板を張る。
-   *
-   * ほんの少し大きめにしているのは、丸め誤差で端に 1px の隙間ができるのを
-   * 防ぐため。板の大きさが変わっても頂点に載る texCoord は 0..1 のままなので、
-   * 絵がずれるのではなく 1% だけ寄る。
-   */
-  private fill(sketch: p5, width: number, height: number): void {
-    sketch.plane(width * 1.02, height * 1.02)
+  /** 画面の横 / 縦 */
+  private aspect(): number {
+    return this.instance.width / Math.max(1, this.instance.height)
   }
 
-  /**
-   * 月のある方向。
-   *
-   * 「画面のここに月を置きたい」を、視線と同じ作り方で方向ベクトルに直す。
-   * シェーダー側は方向同士の角度で月を描くので、水面の反射から見上げた時も
-   * 同じ月が正しい位置に写る。
-   */
-  private moonDirection(aspect: number): [number, number, number] {
-    const x = (this.moonX - 0.5) * aspect
-    const y = MOON_UV_Y - HORIZON_UV
-    const length = Math.hypot(x, y, 1)
-    return [x / length, y / length, -1 / length]
+  /** 描けなかった。理由を一度だけ伝えて、以降は試さない */
+  private fail(error: unknown): void {
+    if (this.broken) return
+    this.broken = true
+    console.error('[introspection-art] 描画を続けられません', error)
+    this.onError?.('この端末では絵を描けませんでした')
   }
 }
