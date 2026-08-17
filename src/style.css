@@ -1,0 +1,196 @@
+/* 画そのものが主役なので、UI は「必要な時だけ薄く出る」以上のことをしない */
+
+:root {
+  --ink: rgba(206, 224, 255, 0.86);
+  --ink-dim: rgba(206, 224, 255, 0.45);
+  --line: rgba(150, 190, 255, 0.28);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: #04060f;
+  overflow: hidden;
+}
+
+body {
+  font-family:
+    'Hiragino Kaku Gothic ProN', 'Noto Sans JP', system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* ---- 入口 ---------------------------------------------------------------- */
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 1.4rem;
+  padding: 2rem;
+  text-align: center;
+  /* 背後の水面をうっすら見せたまま、文字が読める程度に落とす */
+  background: radial-gradient(ellipse at center, rgba(4, 6, 15, 0.55), rgba(4, 6, 15, 0.9));
+  transition: opacity 1.4s ease, visibility 1.4s;
+}
+
+#overlay.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+#overlay h1 {
+  margin: 0;
+  font-size: clamp(2rem, 7vw, 3.6rem);
+  font-weight: 300;
+  letter-spacing: 0.24em;
+  /* 中央寄せの見た目を letter-spacing の余りで崩さない */
+  text-indent: 0.24em;
+}
+
+#overlay-note {
+  margin: 0;
+  max-width: 34ch;
+  font-size: 0.85rem;
+  line-height: 1.9;
+  color: var(--ink-dim);
+}
+
+/* ---- ボタン -------------------------------------------------------------- */
+
+button {
+  font: inherit;
+  font-size: 0.85rem;
+  letter-spacing: 0.16em;
+  text-indent: 0.16em;
+  color: var(--ink);
+  background: rgba(20, 34, 66, 0.35);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.75em 2em;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.4s ease, border-color 0.4s ease, opacity 0.4s ease;
+}
+
+button:hover:not(:disabled),
+button:focus-visible {
+  background: rgba(46, 72, 128, 0.45);
+  border-color: rgba(180, 210, 255, 0.55);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---- 下部 ---------------------------------------------------------------- */
+
+#chrome {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.4rem;
+  padding: 1.1rem 1.5rem;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  color: var(--ink-dim);
+  /* 画の下端に被るので、下に向かって暗く沈ませて文字を読ませる */
+  background: linear-gradient(to top, rgba(2, 4, 10, 0.75), rgba(2, 4, 10, 0));
+}
+
+#chrome p {
+  margin: 0;
+}
+
+#chrome #toggle {
+  padding: 0.5em 1.4em;
+  font-size: 0.7rem;
+}
+
+#chrome .credit strong {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+#chrome a {
+  color: inherit;
+  text-underline-offset: 0.3em;
+  text-decoration-color: var(--line);
+}
+
+#chrome a:hover {
+  color: var(--ink);
+}
+
+#chrome .hint {
+  margin-left: auto;
+}
+
+/* ---- 状態表示 ------------------------------------------------------------ */
+
+#status {
+  position: fixed;
+  top: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 0.6em 1.4em;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(8, 14, 30, 0.7);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  transition: opacity 0.5s ease;
+  pointer-events: none;
+}
+
+#status.is-visible {
+  opacity: 1;
+}
+
+/* ドロップ中は縁が光って、受け取れることを示す */
+body.is-dropping::after {
+  content: '';
+  position: fixed;
+  inset: 0.6rem;
+  border: 1px dashed rgba(150, 196, 255, 0.5);
+  border-radius: 1rem;
+  pointer-events: none;
+}
+
+@media (max-width: 560px) {
+  #chrome .hint {
+    margin-left: 0;
+  }
+}
+
+/* 動きを減らす設定の人には、入口の遷移だけでも静かにする */
+@media (prefers-reduced-motion: reduce) {
+  #overlay {
+    transition-duration: 0.01ms;
+  }
+}
