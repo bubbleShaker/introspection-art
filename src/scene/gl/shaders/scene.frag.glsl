@@ -52,7 +52,8 @@ const int WAVE_POINTS = 128;
  * 球のまわりを一周する波形。4 点ずつ vec4 に詰めてある。
  *
  * float を 128 本並べると、実装によっては uniform の本数の上限に触る。
- * 詰め方は JS 側（waveSphere.ts）が持っていて、ここへは畳んだ結果だけ届く。
+ * JS 側（waveSphere.ts）が渡すのは 128 個並んだ平らな配列で、4 つ組に
+ * 区切っているのはこの宣言の側。輪の中身の作り方は向こうが持っている。
  */
 uniform vec4 uWave[WAVE_POINTS / 4];
 
@@ -426,7 +427,10 @@ const float SPHERE_FORWARD = 3.6;
  * 半径。
  *
  * 見かけの大きさ（uv 系）はおよそ 半径 / 奥行き になる。0.62 / 3.6 ≒ 0.17。
- * これ以上大きくすると月に触れてしまい、水面の光の道ごと隠してしまう。
+ *
+ * 大きくしすぎると月（camera.ts の MOON_UV_Y）に触れ、水面の光の道ごと
+ * 隠してしまう。今は球の頂きと月の下端が uv でおよそ 0.1 空いている。
+ * 月の高さを動かす時は、こちらも一緒に見ること。
  */
 const float SPHERE_RADIUS = 0.62;
 
@@ -478,6 +482,12 @@ float waveSample(int i) {
  * 素直な直線補間だと傾きが 128 か所で飛び、球が多面体に見える。
  */
 float waveAt(vec3 q) {
+  // 極では経度が定まらない。atan(0, 0) は仕様上結果が決まっておらず、
+  // 実装によっては NaN が返る。下の細めは 0 を掛けるだけなので NaN は消せない
+  // （NaN * 0 は NaN）。ここで先に逃がす
+  float around = length(q.xz);
+  if (around < 1e-6) return 0.0;
+
   float lon = atan(q.z, q.x) / TAU + 0.5;
   float pos = lon * float(WAVE_POINTS);
 
@@ -486,8 +496,11 @@ float waveAt(vec3 q) {
   float f = fract(pos);
 
   float value = mix(waveSample(i0), waveSample(i1), f * f * (3.0 - 2.0 * f));
+  // -1..1 に収める。JS 側は tanh に息づかいを足すので、わずかに 1 を超えて届く。
+  // 下の交差判定はこの値域を前提に球の外接を決めているので、ここで頭を揃える
+  value = clamp(value, -1.0, 1.0);
   // 極からの遠さ。赤道で 1、真上と真下で 0
-  return value * sqrt(max(1.0 - q.y * q.y, 0.0));
+  return value * around;
 }
 
 /** その向きでの球の半径。波形のぶんだけ膨らむ */
@@ -610,7 +623,7 @@ vec3 sphereNormal(vec3 q, float amp) {
  * skyColor() で引き、フレネルで球そのものの色と混ぜる。同じ関数から色が来るので、
  * 球と水面はひとりでに同じ夜を映す。波頭が月を返した所だけが白く光る。
  */
-vec3 sphereColor(vec3 rd, vec3 q) {
+vec3 sphereColor(vec3 rd, vec3 q, float surfaceBlur) {
   // 低域が厚いほど表面が荒れる。以前のリングが低域で脈打っていたのと同じ役目
   float amp = SPHERE_WAVE_AMP * (0.80 + uLow * 0.60);
   vec3 normal = sphereNormal(q, amp);
@@ -618,8 +631,10 @@ vec3 sphereColor(vec3 rd, vec3 q) {
   float crest = sphereWave(q).y;
 
   // 面が完全に滑らかだと、月がひとつの点に凝って刺さる。水面と同じく、
-  // 1 ピクセルに収まりきらない細かさぶんだけ滲ませておく
-  float blur = 0.008 + amp * 0.020;
+  // 1 ピクセルに収まりきらない細かさぶんだけ滲ませておく。
+  // surfaceBlur は、水面の反射としてこの球を見ている時に、その水面が
+  // 捨てた細かさが入ってくる（直接見ている時は 0）
+  float blur = 0.008 + amp * 0.020 + surfaceBlur;
 
   vec3 reflected = reflect(rd, normal);
   vec3 col = mix(SPHERE_BODY, skyColor(reflected, blur), fresnel(-rd, normal));
@@ -644,7 +659,9 @@ vec3 sphereColor(vec3 rd, vec3 q) {
   // 表面のうねりに合わせて光の位置が動き、模様が生きて見える
   vec3 halfway = normalize(uMoonDir - rd);
   float spec = pow(max(dot(normal, halfway), 0.0), 22.0);
-  col += MOON_TINT * spec * SPHERE_SPEC;
+  // 遠い水面に映った球では、この鋭い光が 1 ピクセルに収まらない。そのまま
+  // 映すと、水平線寄りで反射像が砂嵐のようにちらつく
+  col += MOON_TINT * spec * SPHERE_SPEC / (1.0 + surfaceBlur * 60.0);
 
   return col;
 }
@@ -669,7 +686,7 @@ void main() {
   float tSphere = sphereSurfaceHit(ro, rd, sphereDir);
 
   if (tSphere > 0.0) {
-    col = sphereColor(rd, sphereDir);
+    col = sphereColor(rd, sphereDir, 0.0);
   } else if (rd.y >= 0.0) {
     col = skyColor(rd, 0.0);
   } else {
@@ -691,7 +708,7 @@ void main() {
     // そのまま飛ばしているので、映り込みは波に合わせて崩れ、球が動けば一緒に動く
     vec3 mirrorDir;
     vec3 above = sphereSurfaceHit(hit, reflected, mirrorDir) > 0.0
-      ? sphereColor(reflected, mirrorDir)
+      ? sphereColor(reflected, mirrorDir, blur)
       : skyColor(reflected, blur);
 
     col = mix(body, above, fresnel(-rd, normal));

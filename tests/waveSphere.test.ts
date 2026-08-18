@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { packWaveRing, WAVE_RING_POINTS } from '../src/scene/waveSphere.ts'
+import sceneSource from '../src/scene/gl/shaders/scene.frag.glsl?raw'
+import { packWaveRing, WAVE_RING_POINTS, WAVE_SLOTS } from '../src/scene/waveSphere.ts'
 
 function ring(): Float32Array {
   return new Float32Array(WAVE_RING_POINTS)
@@ -13,6 +14,23 @@ function steps(values: Float32Array): number[] {
   }
   return out
 }
+
+describe('シェーダーとの取り決め', () => {
+  /**
+   * 輪の点の数は、JS とシェーダーの二か所に書いてある。ずれても例外は飛ばない
+   * （短ければ余った vec4 が前フレームの値のまま残り、長ければ黙って捨てられる）。
+   * 黙って壊れるものは、テストで留めておく。
+   */
+  it('輪の点の数が、シェーダーの WAVE_POINTS と一致する', () => {
+    const found = /const int WAVE_POINTS = (\d+);/.exec(sceneSource)
+    expect(found).not.toBeNull()
+    expect(Number(found?.[1])).toBe(WAVE_RING_POINTS)
+  })
+
+  it('vec4 の本数だけ 4 点ずつ詰めて、輪をちょうど埋め切る', () => {
+    expect(WAVE_SLOTS * 4).toBe(WAVE_RING_POINTS)
+  })
+})
 
 describe('packWaveRing', () => {
   it('無音なら、息づかいのぶんだけ揺れる', () => {
@@ -72,6 +90,17 @@ describe('packWaveRing', () => {
 
     for (const value of out) {
       expect(Number.isNaN(value)).toBe(false)
+    }
+  })
+
+  it('波形が空でも、息づかいだけの輪になる', () => {
+    const out = ring()
+    out.fill(Number.NaN)
+    packWaveRing(new Float32Array(0), 0, out)
+
+    for (const value of out) {
+      expect(Number.isNaN(value)).toBe(false)
+      expect(Math.abs(value)).toBeLessThanOrEqual(0.0701)
     }
   })
 

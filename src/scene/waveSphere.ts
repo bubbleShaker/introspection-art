@@ -10,7 +10,7 @@
  * シェーダー側が交差判定から出す。
  */
 
-/** シェーダーへ渡す時の vec4 の本数。scene.frag.glsl の WAVE_SLOTS と揃える */
+/** シェーダーへ渡す時の vec4 の本数。scene.frag.glsl の uWave[WAVE_POINTS / 4] と揃える */
 export const WAVE_SLOTS = 32
 
 /**
@@ -18,6 +18,10 @@ export const WAVE_SLOTS = 32
  *
  * vec4 に 4 つずつ詰めるので、4 の倍数でなければならない。128 あれば、
  * 球の赤道をぐるりと回っても隣り合う点の段差が見えない。
+ *
+ * **scene.frag.glsl の WAVE_POINTS と必ず揃える**。ずれても例外は飛ばず、
+ * 短ければ余った vec4 が前フレームの値のまま残り、長ければ黙って捨てられる。
+ * tests/waveSphere.test.ts が、シェーダーの原文を読んで一致を確かめている。
  */
 export const WAVE_RING_POINTS = WAVE_SLOTS * 4
 
@@ -32,7 +36,12 @@ const WAVE_GAIN = 2.6
 /** 無音でも輪が死なないように加える、ごく弱い息づかい */
 const BREATH = 0.07
 
-/** 息づかいの速さ（1 秒あたりのラジアン） */
+/**
+ * 息づかいの速さ（timeSec 1 進むごとのラジアン）。
+ *
+ * 渡ってくる時計は実時間ではない。高域が強いほど速く進み、
+ * `prefers-reduced-motion` では遅く進む（glScene.ts が積み上げている）。
+ */
 const BREATH_SPEED = 0.9
 
 /**
