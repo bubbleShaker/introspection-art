@@ -141,8 +141,10 @@ float valueNoise3(vec3 p) {
 /**
  * 3 次元の fbm。段数は 3 で止めてある。
  *
- * 球の格子を押し曲げるうねりに使う（下の wireCoverage を参照）。空の fbm と
- * 同じ 5 段にすると、そこだけで 1 ピクセルあたり 40 回の hash になる。
+ * 球の格子を押し曲げるうねりに使う（下の wireCoverage を参照）。1 回で 24 回の
+ * hash を引き、wireCoverage は 1 ピクセルにつき最大 4 回呼ばれる
+ * （表と裏 × 直に見る場合と水面の反射）。空の fbm と同じ 5 段にすると 1 回で
+ * 40 回になり、そこだけで 1 ピクセルあたり 160 回の hash になる。
  */
 float fbm3(vec3 p) {
   float sum = 0.0;
@@ -558,8 +560,11 @@ const float WIRE_PARALLELS = 12.0;
 /**
  * 線の太さ。単位球の表面での幅（ラジアン）。
  *
- * 画面上の太さはここに交点までの距離が掛かって決まるが、球は動かないので
+ * 画面上の太さは、これを交点までの距離で割った見込み角で決まる。球は動かないので
  * 見かけの太さもほぼ変わらない。
+ *
+ * 本数（WIRE_MERIDIANS / WIRE_PARALLELS）は整数にすること。経線が整数でないと、
+ * 経度の継ぎ目（lon = ±0.5）で fract が飛んで球の裏に縦の筋が出る。
  */
 const float WIRE_WIDTH = 0.010;
 
@@ -616,16 +621,20 @@ float wireLine(float coord, float spacing, float aa) {
  * そこで、1 ピクセルがこの面をどれだけ覆うかを距離と傾きから出し、
  * その幅で滲ませる。細りきった線は滲んで薄い帯として残る。
  *
+ * surfaceBlur は、水面の反射としてこの球を見ている時に、その水面が捨てた
+ * 細かさが入ってくる（直接見ている時は 0）。像そのものが暴れているので、
+ * 1 ピクセルの見込みに足す。足さないと、遠い水面に映った格子が点滅する。
+ *
  * 時刻に係数を掛けないこと（uTime は既にフレーム差分の積み上げで、
  * `prefers-reduced-motion` のぶんも入っている）。
  */
-float wireCoverage(vec3 rd, vec3 q, float t) {
+float wireCoverage(vec3 rd, vec3 q, float t, float surfaceBlur) {
   // 1 ピクセルが、この交点で球面上に覆う長さ（単位球換算）。uv 系は縦で
   // 正規化してあるので、1 ピクセルの見込み角は 1 / uResolution.y になる
-  float pixel = t / (uResolution.y * SPHERE_RADIUS);
+  float spread = (1.0 / uResolution.y + surfaceBlur) * t / SPHERE_RADIUS;
   // 面が視線に対して寝ているほど、同じ 1 ピクセルが表面を広く覆う。
   // 輪郭では発散するので、頭を押さえる
-  float aa = pixel / max(abs(dot(rd, q)), 0.12);
+  float aa = spread / max(abs(dot(rd, q)), 0.12);
 
   // 縦軸からの遠さ。赤道で 1、真上と真下で 0
   float around = length(q.xz);
@@ -636,17 +645,26 @@ float wireCoverage(vec3 rd, vec3 q, float t) {
   float swell = fbm3(q * SPHERE_WARP_FREQ + drift) - 0.5;
 
   // 緯線。波形のぶんだけ上下に押される。経度に沿って輪が波打つので、
-  // 音の形がそのまま骨組みの歪みになる。交差判定でも同じ waveAt で球を
-  // 膨らませてあるから、輪郭のうねりと線のうねりが食い違わない
+  // 音の形がそのまま骨組みの歪みになる。交差判定で球を膨らませているのも
+  // 同じ waveAt なので、輪郭のうねりと線のうねりは同じ波形から来る
+  // （膨らみは半径の向き、こちらは緯度の向きで、動く向きは違う）
   float lat = asin(clamp(q.y, -1.0, 1.0)) / PI;
   float latCoord = lat * WIRE_PARALLELS + waveAt(q) * WIRE_RIB + swell * 0.5;
   float parallels = wireLine(latCoord, PI / WIRE_PARALLELS, aa);
 
-  // 経線。極へ寄るほど隣との間隔が詰まって潰れるので、そこは薄めて逃がす
-  float lon = atan(q.z, q.x) / TAU;
-  float lonCoord = lon * WIRE_MERIDIANS + swell * 0.4;
-  float meridians = wireLine(lonCoord, TAU * around / WIRE_MERIDIANS, aa)
-                  * smoothstep(0.06, 0.45, around);
+  // 経線。極へ寄るほど隣との間隔が詰まって潰れるので、そこは薄めて逃がす。
+  //
+  // 極そのものでは経度が定まらない。atan(0, 0) は仕様上結果が決まっておらず、
+  // 実装によっては NaN が返る。下の薄めは 0 を掛けるだけなので NaN は消せない
+  // （NaN * 0 は NaN）。waveAt() と同じく、ここで先に逃がす。
+  // 1 ピクセルでも NaN が出ると、後段のブルームがそれを面へ広げてしまう
+  float meridians = 0.0;
+  if (around > 1e-6) {
+    float lon = atan(q.z, q.x) / TAU;
+    float lonCoord = lon * WIRE_MERIDIANS + swell * 0.4;
+    meridians = wireLine(lonCoord, TAU * around / WIRE_MERIDIANS, aa)
+              * smoothstep(0.06, 0.45, around);
+  }
 
   // 重なったところが濃くならないよう、足さずに濃い方を取る
   return max(parallels, meridians);
@@ -659,32 +677,35 @@ float wireCoverage(vec3 rd, vec3 q, float t) {
  * 引き、フレネルで線そのものの色と混ぜる。同じ関数から色が来るので、
  * 球と水面はひとりでに同じ夜を映す。
  *
- * 線は球面に貼りついた細い骨なので、法線は球の向き q をそのまま使う。
+ * 線は球面に貼りついた細い骨なので、法線 n は球の向きをそのまま使う。
  * 波形による膨らみの傾きまでは見ない（線が細く、傾きの差が出る幅が無い）。
+ * 向こう側の面では外を向いた面を裏から見ているので、呼ぶ側が n を反転して渡す。
  */
-vec3 wireColor(vec3 rd, vec3 q, float surfaceBlur) {
+vec3 wireColor(vec3 rd, vec3 n, float surfaceBlur) {
   // 面が完全に滑らかだと、月がひとつの点に凝って刺さる。水面と同じく、
   // 1 ピクセルに収まりきらない細かさぶんだけ滲ませておく。
   // surfaceBlur は、水面の反射としてこの球を見ている時に、その水面が
   // 捨てた細かさが入ってくる（直接見ている時は 0）
   float blur = 0.010 + surfaceBlur;
 
-  vec3 col = mix(WIRE_BODY, skyColor(reflect(rd, q), blur), fresnel(-rd, q));
+  vec3 col = mix(WIRE_BODY, skyColor(reflect(rd, n), blur), fresnel(-rd, n));
 
   // 線そのものが灯る。
   //
   // 鏡の反射だけに任せると、正面を向いた線は空の暗いところを返して沈み、
   // 格子が真ん中で消えてしまう。月の側ほど強く、輪郭に近いほど強く灯して、
   // 骨組みが最後まで途切れないようにする。ブルームの前の段なので、この線は滲む。
-  float toward = 0.20 + 0.80 * (dot(q, uMoonDir) * 0.5 + 0.5);
-  // 縁ほど強い。線が視線に対して寝ている所ほど、骨を横から見ることになる
-  float limb = pow(1.0 - abs(dot(rd, q)), 1.4);
+  float toward = 0.20 + 0.80 * (dot(n, uMoonDir) * 0.5 + 0.5);
+  // 縁ほど強い。線が視線に対して寝ている所ほど、骨を横から見ることになる。
+  // 内積は正規化の誤差で 1 をわずかに超えることがある。pow の底が負になると
+  // 結果が決まらない（NaN が返りうる）ので、0 で止める
+  float limb = pow(max(1.0 - abs(dot(rd, n)), 0.0), 1.4);
   col += MOON_TINT * toward * (0.34 + 0.66 * limb) * WIRE_GLOW * (0.75 + uLow * 0.55);
 
   // 線が月を返す鋭い光。月と視線のちょうど真ん中を向いた所だけが光るので、
   // 球が波打つのに合わせて光の位置が線の上を滑る
   vec3 halfway = normalize(uMoonDir - rd);
-  float spec = pow(max(dot(q, halfway), 0.0), 22.0);
+  float spec = pow(max(dot(n, halfway), 0.0), 22.0);
   // 遠い水面に映った球では、この鋭い光が 1 ピクセルに収まらない。そのまま
   // 映すと、水平線寄りで反射像が砂嵐のようにちらつく
   col += MOON_TINT * spec * WIRE_SPEC / (1.0 + surfaceBlur * 60.0);
@@ -700,11 +721,14 @@ vec4 wireLayer(vec3 ro, vec3 rd, bool farSide, float surfaceBlur) {
   float t = sphereSurfaceHit(ro, rd, farSide, q);
   if (t < 0.0) return vec4(0.0);
 
-  float cover = wireCoverage(rd, q, t);
+  float cover = wireCoverage(rd, q, t, surfaceBlur);
   // 線の無いところが大半。空を引きに行く前にここで落とす
   if (cover < 0.004) return vec4(0.0);
 
-  return vec4(wireColor(rd, q, surfaceBlur), cover);
+  // 向こう側の面は、外を向いた面を裏から見ている。q のままだと視線と法線が
+  // 同じ側を向き、フレネルが 1 に張りついて反射も球の内側を向いてしまう
+  vec3 normal = farSide ? -q : q;
+  return vec4(wireColor(rd, normal, surfaceBlur), cover);
 }
 
 /**
@@ -715,7 +739,11 @@ vec4 wireLayer(vec3 ro, vec3 rd, bool farSide, float surfaceBlur) {
  */
 vec4 sphereWire(vec3 ro, vec3 rd, float surfaceBlur) {
   // 膨らみきった大きさの球で先に外す。水面の反射からもこの判定を通すので、
-  // 画面のほとんどを占める「球に当たらない視線」をここで安く落とす
+  // 画面のほとんどを占める「球に当たらない視線」をここで安く落とす。
+  //
+  // 見ているのは手前の根だけなので、目や水面の当たり点がこの外接球の内側に
+  // 入ると、球が丸ごと消える。SPHERE_HOVER を下げる時はここが効いてくる
+  // （今は水面から球心まで 0.84、外接半径 0.69 で、0.15 ぶんの余裕がある）
   if (sphereHit(ro, rd, SPHERE_RADIUS * (1.0 + SPHERE_SWING), false) < 0.0) return vec4(0.0);
 
   vec4 back = wireLayer(ro, rd, true, surfaceBlur);

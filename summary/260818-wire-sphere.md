@@ -56,8 +56,9 @@ col = mix(col, wire.rgb, wire.a);   // 線の無いところは a = 0 で、背�
 出して、その幅で滲ませた。
 
 ```glsl
-float pixel = t / (uResolution.y * SPHERE_RADIUS);      // 1 ピクセルの見込み幅
-float aa    = pixel / max(abs(dot(rd, q)), 0.12);       // 寝ている面ほど広く覆う
+// 1 ピクセルの見込み幅。水面の反射として見ている時は、水面が捨てた暴れも足す
+float spread = (1.0 / uResolution.y + surfaceBlur) * t / SPHERE_RADIUS;
+float aa     = spread / max(abs(dot(rd, q)), 0.12);   // 寝ている面ほど広く覆う
 ```
 
 `fwidth()` を使わなかったのは、交点が分岐の中で決まるため。当たらない
@@ -99,9 +100,21 @@ return line * mix(0.34, 1.0, min(1.0, WIRE_WIDTH * 3.0 / max(aa, 1e-5)));
 | `SPHERE_BAND_FREQ` / `SPHERE_WAVE_AMP` / `SPHERE_RIB` | 同上（`WIRE_*` へ置き換え） |
 | `sphereColor()` | `wireColor()` + `wireCoverage()` + `sphereWire()` へ |
 
-`fbm3()` は残した。法線を作るために 1 ピクセルあたり 4 回呼んでいたものが、
-格子を押し曲げるうねりとして 1 回で済むようになったので、球のピクセルは
-むしろ軽くなっている。
+`fbm3()` は残した。法線を作るために 1 つの面につき 4 回呼んでいたものが、
+格子を押し曲げるうねりとして 1 回で済む。面が 2 枚（表と裏）になったので
+1 ピクセルあたりでは 8 回 → 4 回で、球のピクセルはむしろ軽くなっている。
 
 `src/audio/`, `src/core/`, `src/scene/waveSphere.ts` は触っていない。
 シェーダーへ渡る波形の作り方は #13 のまま。
+
+## レビューで直したもの
+
+`reviewer` サブエージェントの指摘のうち、実装に反映したもの。
+
+| 指摘 | 直し方 |
+| --- | --- |
+| 極で `atan(0, 0)` が無防備。NaN が 1 ピクセルでも出るとブルームが面へ広げる | `waveAt()` と同じく `around > 1e-6` で先に逃がす。`smoothstep` で 0 を掛けても `NaN * 0` は `NaN` のままなので、掛け算では消せない |
+| 水面の反射から見た格子の滲みが足りず、遠景で点滅する | 1 ピクセルの見込みに `surfaceBlur` を足す。`wireColor()` は受け取っていたのに `wireCoverage()` が受け取っていなかった |
+| 向こう側の面で法線が裏返っていて、フレネルが 1.0 に張りついていた | `wireLayer()` で `farSide` なら法線を反転して渡す |
+| `pow()` の底が正規化誤差で負になりうる | `max(..., 0.0)` を一枚かませる |
+| README / PLAN が、消えた `sphereColor()` を現在形で説明していた | 両方とも現状に書き直した |
