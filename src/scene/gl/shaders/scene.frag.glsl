@@ -28,6 +28,14 @@ uniform float uHorizon;
 /** 動きの控えめさ。prefers-reduced-motion で小さくなる */
 uniform float uMotion;
 /**
+ * 球の格子を回した量。秒に相当するが、実時間ではない。
+ *
+ * 音が強いほど速く進み、`prefers-reduced-motion` では遅く進む。速さを
+ * シェーダー側で掛けずに JS 側で積み上げているのは、速さが変わった瞬間に
+ * 姿勢が飛ばないようにするため（uTime と同じ作法）。
+ */
+uniform float uSpin;
+/**
  * 水面からの目の高さ。波の周期はワールド単位で決めるので、この値が
  * 「どれくらいの大きさの波を見ているか」の基準になる。
  */
@@ -102,59 +110,6 @@ float valueNoise(vec2 p) {
     mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x),
     u.y
   );
-}
-
-float hash31(vec3 p) {
-  p = fract(p * vec3(123.34, 456.21, 789.13));
-  p += dot(p, p.yzx + 45.32);
-  return fract((p.x + p.y) * p.z);
-}
-
-/**
- * 値ノイズの 3 次元版。球の表面に使う。
- *
- * 平面のノイズを球へ貼ると、極で必ず縮んで模様が渦を巻く。空間の側に
- * ノイズを敷いて球でくり抜けば、どこを見ても同じ細かさになる。
- */
-float valueNoise3(vec3 p) {
-  vec3 i = floor(p);
-  vec3 f = fract(p);
-  vec3 u = f * f * (3.0 - 2.0 * f);
-
-  // 手前の面と奥の面をそれぞれ双線形に混ぜ、最後に奥行きで混ぜる
-  float n000 = hash31(i);
-  float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
-  float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
-  float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
-  float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
-  float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
-  float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
-  float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
-
-  return mix(
-    mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
-    mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y),
-    u.z
-  );
-}
-
-/**
- * 3 次元の fbm。段数は 3 で止めてある。
- *
- * 球の格子を押し曲げるうねりに使う（下の wireCoverage を参照）。1 回で 24 回の
- * hash を引き、wireCoverage は 1 ピクセルにつき最大 2 回呼ばれる（表と裏）。
- * 空の fbm と同じ 5 段にすると 1 回で 40 回になり、そこだけで 1 ピクセルあたり
- * 80 回の hash になる。
- */
-float fbm3(vec3 p) {
-  float sum = 0.0;
-  float amp = 0.5;
-  for (int i = 0; i < 3; i++) {
-    sum += valueNoise3(p) * amp;
-    p = p * 2.07 + 13.1;
-    amp *= 0.5;
-  }
-  return sum;
 }
 
 /** 倍の細かさを半分の強さで重ねる。雲のような、大小の入れ子になった形を作る */
@@ -420,9 +375,12 @@ float fresnel(vec3 view, vec3 normal) {
 //
 // 水面のすぐ上に浮かぶ、格子だけでできた球。音の波形はここに現れる。
 //
-// 面は持たない。緯線と経線の細い骨があるだけで、線と線の隙間からは背後の海と
-// 空がそのまま透ける。波形は面の凹凸ではなく、骨組みの歪みとして現れる。
+// 面は持たない。互いに平行な平面で球を切った跡の円が、細い骨として並ぶだけで、
+// 線と線の隙間からは背後の海と空がそのまま透ける。線そのものも半透明である。
 // 向こう側の線も描くので、中が空洞であることが形として分かる。
+//
+// 形は完全な球で、音では歪まない。音に応じて動くのは、線の濃さ・球全体の
+// 大きさ（一様な呼吸）・回る速さの三つだけである。
 //
 // 世界の光は受けない。線は白一色で、月を映しもしなければ、水面へ映りもしない。
 // 海と空の手前に重なるだけの別のレイヤとして置いてある。
@@ -431,7 +389,7 @@ float fresnel(vec3 view, vec3 normal) {
 const float SPHERE_FORWARD = 3.6;
 
 /**
- * 半径。
+ * 半径。呼吸（SPHERE_BREATH）でここから最大 +6% まで膨らむ。
  *
  * 見かけの大きさ（uv 系）はおよそ 半径 / 奥行き になる。0.62 / 3.6 ≒ 0.17。
  *
@@ -470,8 +428,18 @@ float sphereHit(vec3 ro, vec3 rd, float radius, bool farSide) {
   return t > 0.0 ? t : -1.0;
 }
 
-/** 波形が球の半径をどれだけ膨らませるか（半径に対する割合） */
-const float SPHERE_SWING = 0.12;
+/**
+ * 呼吸の深さ。低域がいっぱいの時に半径がこの割合だけ膨らむ。
+ *
+ * 膨らみは向きに依らない一定倍なので、輪郭はいつでも真円のまま大きさだけが
+ * 脈打つ。以前はここで波形を向きごとに掛けていて、それが輪郭のヨレになっていた。
+ */
+const float SPHERE_BREATH = 0.06;
+
+/** 今の半径。向きを取らないことが「綺麗な球」の中身そのもの */
+float sphereRadius() {
+  return SPHERE_RADIUS * (1.0 + uLow * SPHERE_BREATH);
+}
 
 /** 輪の i 番目。4 点ずつ vec4 に詰めてあるので、割った先の成分を引く */
 float waveSample(int i) {
@@ -481,14 +449,14 @@ float waveSample(int i) {
 /**
  * その向きの波形の値。-1..1。
  *
- * 縦軸まわりの角度（経度）で輪を引く。以前のリングが画面上の角度で輪を
- * 引いていたのと同じもので、平面が球になったぶん、輪は赤道に沿って回る。
+ * 縦軸まわりの角度（経度）で輪を引く。形は動かさない。この値が動かすのは
+ * 線の濃さだけで、音の強い向きの線がその場で明るくなる。
  *
  * 真上と真下では経度が定まらないので、極へ近づくほど細める。細めないと、
  * 極の一点で輪の全部の値がぶつかって、そこだけがちらつく。
  *
- * 隣り合う 2 点を 3t^2-2t^3 で混ぜているのは、この値を微分して法線を作るため。
- * 素直な直線補間だと傾きが 128 か所で飛び、球が多面体に見える。
+ * 隣り合う 2 点を 3t^2-2t^3 で混ぜているのは、線の濃さが 128 か所で
+ * 段になるのを避けるため。
  */
 float waveAt(vec3 q) {
   // 極では経度が定まらない。atan(0, 0) は仕様上結果が決まっておらず、
@@ -505,80 +473,77 @@ float waveAt(vec3 q) {
   float f = fract(pos);
 
   float value = mix(waveSample(i0), waveSample(i1), f * f * (3.0 - 2.0 * f));
-  // -1..1 に収める。JS 側は tanh に息づかいを足すので、わずかに 1 を超えて届く。
-  // 下の交差判定はこの値域を前提に球の外接を決めているので、ここで頭を揃える
+  // -1..1 に収める。JS 側は tanh に息づかいを足すので、わずかに 1 を超えて届く
   value = clamp(value, -1.0, 1.0);
   // 極からの遠さ。赤道で 1、真上と真下で 0
   return value * around;
 }
 
-/** その向きでの球の半径。波形のぶんだけ膨らむ */
-float sphereRadiusAt(vec3 q) {
-  return SPHERE_RADIUS * (1.0 + waveAt(q) * SPHERE_SWING);
+/**
+ * 格子の姿勢。
+ *
+ * 球そのものは向きを持たない（どう回しても同じ真円）ので、回るのは表面の
+ * 格子と波形の輪の方である。ここで作った行列を、交点の向きに掛けてから
+ * 線を引く。
+ *
+ * **3 軸を等しく回し切ってはいけない**。線が平行に見えるのは、格子の軸が
+ * 画面の面に寝ている（＝切り口の平面を横から見ている）あいだだけで、軸が
+ * こちらを向くと、その家族はまとめて同心円に化ける。
+ *
+ * そこで、視線の軸（z）まわりだけを回し切り、残る 2 軸は振れ幅を抑えて
+ * 揺らすに留める。z まわりの回転は軸を画面の面から起こさないので、格子は
+ * 平行なまま風車のように回り、他の 2 軸の揺れが、そこへ立体の転がりを足す。
+ *
+ * 振れ幅（0.42 / 0.38 ラジアン ≒ ±24° / ±22°）を大きくすると、線が閉じた輪に
+ * 見え始める。周期を揃えないのは、揃えると決まった周期で同じ姿勢へ戻ってきて、
+ * 回転が「往復」に見えてしまうため。
+ *
+ * 時計（uSpin）は JS 側で積み上げたもの。音で速さが変わっても位相が飛ばない。
+ */
+mat3 spinMatrix(float t) {
+  // 画面の面から起こす向き。振れ幅を持たせるだけで、回し切らない
+  float ax = sin(t * 0.19) * 0.42;
+  float ay = sin(t * 0.13 + 2.2) * 0.38;
+  // 視線の軸まわり。ここだけを回し切る
+  float az = t * 0.30 + sin(t * 0.11) * 0.5;
+
+  float sx = sin(ax), cx = cos(ax);
+  float sy = sin(ay), cy = cos(ay);
+  float sz = sin(az), cz = cos(az);
+
+  // mat3 の引数は列ごとに並べる
+  mat3 rx = mat3(1.0, 0.0, 0.0,  0.0, cx, sx,  0.0, -sx, cx);
+  mat3 ry = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
+  mat3 rz = mat3(cz, sz, 0.0,  -sz, cz, 0.0,  0.0, 0.0, 1.0);
+
+  // **掛ける順は rz が先**（q に最初に当たるのが rz）。こうすると格子の x 軸の
+  // 面外成分がちょうど sin(ay)、y 軸が sin(ax) になり、上の振れ幅がそのまま
+  // 「軸が画面の面から起きる角度」の上限として効く。
+  //
+  // 逆に rz * ry * rx と書くと、面内の回転が揺れを画面の外へ持ち出す向きにも
+  // 回してしまい、面外角は sqrt(sin²ax + cos²ax·sin²ay) まで開く。
+  // 同じ振れ幅のまま 24° が 32° になり、線が輪に見える姿勢が出てくる
+  return rx * ry * rz;
 }
 
 /**
- * 波形で膨らんだ球との交差。当たった向き（中心から見た単位ベクトル）を hitDir へ。
- * farSide を立てると、向こう側の面を取る。
+ * 格子の本数。球の端から端までに何本並ぶか。
  *
- * 半径が向きで変わるので、二次方程式ひとつでは解けない。輪郭の形を決めているのは
- * 「視線が中心にいちばん近づく点の向き」なので、まずそこの半径で球を切り、
- * 出てきた交点の向きでもう一度切り直す。膨らみが半径の 1 割強なら、
- * この 2 回でほぼ収まる（レイマーチせずに済む）。
+ * 縦線・横線それぞれ、この本数が等間隔（球面上の弧の長さで等間隔）に並ぶ。
  *
- * 「そもそも球に届くか」はここでは見ない。呼び元（sphereWire）が、表と裏の
- * 2 枚を引く前に一度だけ外接球で外している。
+ * **奇数にすること**。偶数だと真ん中の線が弧 ±PI/2、つまり軸が球を貫く点の
+ * 上にちょうど乗る。そこは線が点に潰れるうえ asin の精度がいちばん落ちる
+ * ところなので、白い粒がちらつく。
  */
-float sphereSurfaceHit(vec3 ro, vec3 rd, bool farSide, out vec3 hitDir) {
-  vec3 oc = ro - SPHERE_CENTER;
-  // 中心から、視線がいちばん近づく点へ。輪郭はこの向きの半径で決まる
-  vec3 near = oc - dot(oc, rd) * rd;
-  float span = length(near);
-  // 中心をまっすぐ貫く視線だけは向きが定まらない。そこは輪郭から最も遠いので、
-  // どの向きを充てても輪郭は変わらない
-  vec3 edgeDir = span > 1e-4 ? near / span : vec3(1.0, 0.0, 0.0);
-
-  float t = sphereHit(ro, rd, sphereRadiusAt(edgeDir), farSide);
-  if (t < 0.0) return -1.0;
-
-  hitDir = normalize(ro + rd * t - SPHERE_CENTER);
-
-  // 切り直した半径の方が小さいと、視線がその球を外すことがある。そこで
-  // 「当たらなかった」を返すと、輪郭の内側に穴が空いて縁が二重に見える。
-  // 一度当たっている以上、表面はそこにある。外れた時は 1 段目をそのまま使う
-  float refined = sphereHit(ro, rd, sphereRadiusAt(hitDir), farSide);
-  if (refined <= 0.0) return t;
-
-  hitDir = normalize(ro + rd * refined - SPHERE_CENTER);
-  return refined;
-}
-
-/** 経線の数。球をひと回りするあいだに何本くぐるか */
-const float WIRE_MERIDIANS = 12.0;
-
-/** 緯線の数。極から極までに何本並ぶか */
-const float WIRE_PARALLELS = 8.0;
+const float GRID_COLS = 7.0;
+const float GRID_ROWS = 7.0;
 
 /**
  * 線の太さ。単位球の表面での幅（ラジアン）。
  *
- * 画面上の太さは、これを交点までの距離で割った見込み角で決まる。球は動かないので
- * 見かけの太さもほぼ変わらない。
- *
- * 本数（WIRE_MERIDIANS / WIRE_PARALLELS）は整数にすること。経線が整数でないと、
- * 経度の継ぎ目（lon = ±0.5）で fract が飛んで球の裏に縦の筋が出る。
+ * 画面上の太さは、これを交点までの距離で割った見込み角で決まる。
  */
 const float WIRE_WIDTH = 0.005;
-
-/** 格子を押し曲げるうねりの細かさ */
-const float SPHERE_WARP_FREQ = 2.1;
-
-/**
- * 波形が緯線をどれだけ押し上げるか。緯線 1 本ぶんの間隔に対する割合。
- *
- * 1.0 を超えると、押された緯線が隣を追い越して格子が絡まる。
- */
-const float WIRE_RIB = 0.26;
 
 /**
  * 線の色。世界の光を受けない、ただの白。
@@ -589,6 +554,17 @@ const float WIRE_RIB = 0.26;
  * 煙に見える。
  */
 const vec3 WIRE_COLOR = vec3(0.95);
+
+/**
+ * 線の濃さの頭。1 で不透明。
+ *
+ * 線が覆いきったところでも背後の海と空が透ける。格子は世界の手前に重なる
+ * 別のレイヤなので、透けることで「間に何も挟まっていない」ことが見える。
+ */
+const float WIRE_ALPHA = 0.55;
+
+/** 波形が線の濃さをどれだけ上下させるか。WIRE_ALPHA に対する割合 */
+const float WIRE_WAVE = 0.45;
 
 /** 向こう側の線をどれだけ薄く重ねるか */
 const float WIRE_BACK = 0.35;
@@ -610,6 +586,24 @@ float wireLine(float coord, float spacing, float aa, float fade) {
 }
 
 /**
+ * ひとつの軸に垂直な平面群で球を切った、線の濃さ。
+ *
+ * s は中心から見た向きの、その軸ぶんの成分（-1..1）。s が一定の点は円を描き、
+ * その円が 1 本の線になる。**軸に垂直な平面はどれも互いに平行**なので、
+ * 出来る円も互いに交わらない。緯線・経線のように一点へ集まる極が無い。
+ *
+ * 線を等間隔に並べるのに s ではなく asin(s) を使う。s のまま等間隔に切ると、
+ * 画面では等間隔でも球面上では端ほど間延びして、丸みが消えて方眼紙に見える。
+ * asin(s) は球面上の弧の長さそのもの（この向きの傾きがどこでも 1 になる）なので、
+ * 「球の上で等間隔」が「画面では端ほど詰まる」になり、丸みが出る。
+ * spacing を PI / count と書き切れるのも、そのおかげである。
+ */
+float gridLines(float s, float count, float aa, float fade) {
+  float arc = asin(clamp(s, -1.0, 1.0));
+  return wireLine(arc * count / PI, PI / count, aa, fade);
+}
+
+/**
  * その向きに格子線がどれだけ掛かっているか。0..1。
  * q は中心から見た単位ベクトル、t は交点までの距離。
  *
@@ -624,13 +618,13 @@ float wireLine(float coord, float spacing, float aa, float fade) {
  *   - fade は「1 ピクセルに収まらなくなった線は、そのぶん薄い」という縮小の
  *     作法。こちらは頭を押さえない。潰れきった線は滲まずに消える
  *
- * 時刻に係数を掛けないこと（uTime は既にフレーム差分の積み上げで、
- * `prefers-reduced-motion` のぶんも入っている）。
+ * spin（格子の姿勢）と radius（今の半径）は、フレームの中で動かない値なので
+ * 呼ぶ側で 1 回だけ作って渡す。ここは 1 ピクセルにつき最大 2 回呼ばれる。
  */
-float wireCoverage(vec3 rd, vec3 q, float t) {
+float wireCoverage(vec3 rd, vec3 q, float t, float radius, mat3 spin) {
   // 1 ピクセルが、この交点で球面上に覆う長さ（単位球換算）。uv 系は縦で
   // 正規化してあるので、1 ピクセルの見込み角は 1 / uResolution.y になる
-  float spread = t / (uResolution.y * SPHERE_RADIUS);
+  float spread = t / (uResolution.y * radius);
   // 面が視線に対して寝ているほど、同じ 1 ピクセルが表面を広く覆う。
   // 輪郭では発散するので、0 割りにならない程度にだけ止める
   float grazing = spread / max(abs(dot(rd, q)), 0.03);
@@ -639,51 +633,29 @@ float wireCoverage(vec3 rd, vec3 q, float t) {
   // 潰れて太さを割った線は、滲ませずに濃さで落とす
   float fade = min(1.0, WIRE_WIDTH * 3.0 / grazing);
 
-  // 縦軸からの遠さ。赤道で 1、真上と真下で 0
-  float around = length(q.xz);
+  // 格子の姿勢へ持ち込む。以降の x・y は、回っている格子の側の縦横である
+  vec3 g = spin * q;
 
-  // 座標そのものを時間で流す。格子が形を保ったまま、ゆっくり波打って巡る。
-  // これが無いと、幾何のとおりの網が硬く貼りついて見える
-  vec3 drift = vec3(uTime * 0.05, uTime * 0.09, uTime * 0.04);
-  float swell = fbm3(q * SPHERE_WARP_FREQ + drift) - 0.5;
-
-  // 緯線。波形のぶんだけ上下に押される。経度に沿って輪が波打つので、
-  // 音の形がそのまま骨組みの歪みになる。交差判定で球を膨らませているのも
-  // 同じ waveAt なので、輪郭のうねりと線のうねりは同じ波形から来る
-  // （膨らみは半径の向き、こちらは緯度の向きで、動く向きは違う）
-  float lat = asin(clamp(q.y, -1.0, 1.0)) / PI;
-  float latCoord = lat * WIRE_PARALLELS + waveAt(q) * WIRE_RIB + swell * 0.5;
-  // 極のすぐ際の緯線は、輪が点に縮んで画面では白い粒にしかならない。落とす
-  float parallels = wireLine(latCoord, PI / WIRE_PARALLELS, aa, fade)
-                  * smoothstep(0.0, 0.10, around);
-
-  // 経線。極へ寄るほど隣との間隔が詰まって潰れるので、そこは薄めて逃がす。
-  //
-  // 極そのものでは経度が定まらない。atan(0, 0) は仕様上結果が決まっておらず、
-  // 実装によっては NaN が返る。下の薄めは 0 を掛けるだけなので NaN は消せない
-  // （NaN * 0 は NaN）。waveAt() と同じく、ここで先に逃がす。
-  // 1 ピクセルでも NaN が出ると、後段のブルームがそれを面へ広げてしまう
-  float meridians = 0.0;
-  if (around > 1e-6) {
-    float lon = atan(q.z, q.x) / TAU;
-    float lonCoord = lon * WIRE_MERIDIANS + swell * 0.4;
-    meridians = wireLine(lonCoord, TAU * around / WIRE_MERIDIANS, aa, fade)
-              * smoothstep(0.06, 0.45, around);
-  }
+  // 縦線は x が一定の円、横線は y が一定の円。どちらの家族も
+  // 「互いに平行な平面で切った跡」なので、線どうしが交わって集まる点が無い
+  float columns = gridLines(g.x, GRID_COLS, aa, fade);
+  float rows = gridLines(g.y, GRID_ROWS, aa, fade);
 
   // 重なったところが濃くならないよう、足さずに濃い方を取る
-  return max(parallels, meridians);
+  float ink = max(columns, rows);
+  // 球に当たった視線でも、線が乗るのは面積のごく一部。残りは波形を引かずに帰る
+  if (ink <= 0.0) return 0.0;
+
+  // 音は形ではなく濃さに出る。波形の強い向きの線が、その場で明るくなる
+  return ink * clamp(WIRE_ALPHA * (1.0 + waveAt(g) * WIRE_WAVE), 0.0, 1.0);
 }
 
 /**
- * 格子の面 1 枚ぶんの覆い。当たらなければ 0。
+ * 交点 1 つぶんの覆い。t はそこまでの距離。
  */
-float wireLayer(vec3 ro, vec3 rd, bool farSide) {
-  vec3 q;
-  float t = sphereSurfaceHit(ro, rd, farSide, q);
-  if (t < 0.0) return 0.0;
-
-  return wireCoverage(rd, q, t);
+float wireLayer(vec3 ro, vec3 rd, float t, float radius, mat3 spin) {
+  vec3 q = normalize(ro + rd * t - SPHERE_CENTER);
+  return wireCoverage(rd, q, t, radius, spin);
 }
 
 /**
@@ -694,18 +666,30 @@ float wireLayer(vec3 ro, vec3 rd, bool farSide) {
  *
  * 中は空洞なので、向こう側の面の線も数える。手前より薄く重ねると、
  * 奥と手前が見分けられて球の中が空いて見える。
+ *
+ * 半径が向きに依らなくなったので、交差は二次方程式 1 本で足りる。膨らみが
+ * 向きで変わっていた頃は、輪郭の半径で一度切ってから交点の向きで切り直す、
+ * という 2 段階が要った。
  */
 float sphereWire(vec3 ro, vec3 rd) {
-  // 膨らみきった大きさの球で先に外す。画面のほとんどを占める
-  // 「球に当たらない視線」をここで安く落とす。
-  //
-  // 見ているのは手前の根だけなので、目がこの外接球の内側に入ると球が丸ごと
-  // 消える。効くのは目から球心までの距離（ほぼ SPHERE_FORWARD = 3.6）で、
-  // 外接半径 0.69 とは桁が違う。SPHERE_FORWARD を大きく詰める時は見ること
-  if (sphereHit(ro, rd, SPHERE_RADIUS * (1.0 + SPHERE_SWING), false) < 0.0) return 0.0;
+  float radius = sphereRadius();
 
-  float back = wireLayer(ro, rd, true) * WIRE_BACK;
-  float front = wireLayer(ro, rd, false);
+  // 画面のほとんどを占める「球に当たらない視線」をここで安く落とす。
+  //
+  // 目は球の外にいるので、手前が外れるなら向こう側も外れる。逆に目が球の内側へ
+  // 入ると、手前の交点が背中側に回って球が丸ごと消える。効くのは目から球心までの
+  // 距離（ほぼ SPHERE_FORWARD = 3.6）で、半径 0.62 とは桁が違う。
+  // SPHERE_FORWARD を大きく詰める時は見ること
+  float tFront = sphereHit(ro, rd, radius, false);
+  if (tFront < 0.0) return 0.0;
+  // ここまで来れば向こう側は必ずある（-b + root >= -b - root > 0）
+  float tBack = sphereHit(ro, rd, radius, true);
+
+  // 姿勢はフレームの中で動かない。ここで 1 回だけ作り、2 枚に使い回す
+  mat3 spin = spinMatrix(uSpin);
+
+  float front = wireLayer(ro, rd, tFront, radius, spin);
+  float back = wireLayer(ro, rd, tBack, radius, spin) * WIRE_BACK;
 
   // 奥のうえに手前を重ねる
   return front + back * (1.0 - front);
@@ -751,8 +735,9 @@ void main() {
   // 格子を背景のうえへ重ねる。丸ごと水面より上にあるので、当たったならそれは
   // 必ず水面より手前。距離を比べるまでもなく、そのまま乗せてよい。
   //
-  // 線が覆いきったところの色は WIRE_COLOR そのものになる。後ろの絵が何であれ
-  // 同じ白になることが、「同じ世界にいない」ことの見え方になっている
+  // 覆いは 1 に届かない（WIRE_ALPHA で頭を押さえてある）ので、線のいちばん濃い
+  // ところでも背後の海と空が透ける。透けてなお、線の色は後ろの絵と混ざるだけで
+  // 後ろから光を受けはしない。それが「同じ世界にいない」ことの見え方になっている
   col = mix(col, WIRE_COLOR, sphereWire(ro, rd));
 
   // 明るいところを圧縮する。月の芯が真っ白に潰れず、光が丸く残る
