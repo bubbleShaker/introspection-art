@@ -45,7 +45,21 @@ const int MAX_RIPPLES = 12;
 uniform vec4 uRipples[MAX_RIPPLES];
 uniform int uRippleCount;
 
+/** 波形の輪の点の数。waveSphere.ts の WAVE_RING_POINTS と揃える */
+const int WAVE_POINTS = 128;
+
+/**
+ * 球のまわりを一周する波形。4 点ずつ vec4 に詰めてある。
+ *
+ * float を 128 本並べると、実装によっては uniform の本数の上限に触る。
+ * JS 側（waveSphere.ts）が渡すのは 128 個並んだ平らな配列で、4 つ組に
+ * 区切っているのはこの宣言の側。輪の中身の作り方は向こうが持っている。
+ */
+uniform vec4 uWave[WAVE_POINTS / 4];
+
 out vec4 fragColor;
+
+const float TAU = 6.28318530718;
 
 // ---- 色 --------------------------------------------------------------------
 
@@ -87,6 +101,58 @@ float valueNoise(vec2 p) {
     mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x),
     u.y
   );
+}
+
+float hash31(vec3 p) {
+  p = fract(p * vec3(123.34, 456.21, 789.13));
+  p += dot(p, p.yzx + 45.32);
+  return fract((p.x + p.y) * p.z);
+}
+
+/**
+ * 値ノイズの 3 次元版。球の表面に使う。
+ *
+ * 平面のノイズを球へ貼ると、極で必ず縮んで模様が渦を巻く。空間の側に
+ * ノイズを敷いて球でくり抜けば、どこを見ても同じ細かさになる。
+ */
+float valueNoise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  vec3 u = f * f * (3.0 - 2.0 * f);
+
+  // 手前の面と奥の面をそれぞれ双線形に混ぜ、最後に奥行きで混ぜる
+  float n000 = hash31(i);
+  float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
+  float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
+  float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
+  float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
+  float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
+  float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
+  float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
+
+  return mix(
+    mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
+    mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y),
+    u.z
+  );
+}
+
+/**
+ * 3 次元の fbm。段数は 3 で止めてある。
+ *
+ * これは球の法線を作るために 1 ピクセルにつき 4 回呼ばれる（下の
+ * sphereNormal を参照）。空の fbm と同じ 5 段にすると、そこだけで
+ * 1 ピクセルあたり 160 回の hash になる。
+ */
+float fbm3(vec3 p) {
+  float sum = 0.0;
+  float amp = 0.5;
+  for (int i = 0; i < 3; i++) {
+    sum += valueNoise3(p) * amp;
+    p = p * 2.07 + 13.1;
+    amp *= 0.5;
+  }
+  return sum;
 }
 
 /** 倍の細かさを半分の強さで重ねる。雲のような、大小の入れ子になった形を作る */
@@ -348,6 +414,258 @@ float fresnel(vec3 view, vec3 normal) {
   return 0.02 + 0.98 * pow(base, 5.0);
 }
 
+// ---- 球 --------------------------------------------------------------------
+//
+// 水面のすぐ上に浮かぶ球。音の波形はここに現れる（以前は画面へ後乗せした
+// 平らなリングだった）。水面と同じ世界に置いてあるので、月を映し、
+// フレネルで縁が光り、ブルームの前の段なので波頭が滲む。
+
+/** 目からの奥行き（-z 方向） */
+const float SPHERE_FORWARD = 3.6;
+
+/**
+ * 半径。
+ *
+ * 見かけの大きさ（uv 系）はおよそ 半径 / 奥行き になる。0.62 / 3.6 ≒ 0.17。
+ *
+ * 大きくしすぎると月（camera.ts の MOON_UV_Y）に触れ、水面の光の道ごと
+ * 隠してしまう。今は球の頂きと月の下端が uv でおよそ 0.1 空いている。
+ * 月の高さを動かす時は、こちらも一緒に見ること。
+ */
+const float SPHERE_RADIUS = 0.62;
+
+/** 水面からどれだけ浮いているか。真下に映り込みが入るだけの隙間を空ける */
+const float SPHERE_HOVER = 0.22;
+
+const vec3 SPHERE_CENTER = vec3(0.0, SPHERE_HOVER + SPHERE_RADIUS, -SPHERE_FORWARD);
+
+/** 球そのものの色。水と同じく、自分では光らず映すだけ */
+const vec3 SPHERE_BODY = vec3(0.008, 0.014, 0.034);
+
+/**
+ * レイと球の交差。手前の交点までの距離を返す。当たらなければ -1。
+ *
+ * rd は正規化済みなので、二次方程式の a が 1 になって式が短くなる。
+ * 内側からの交点（t < 0 の側）は使わない。球の中には入らない。
+ */
+float sphereHit(vec3 ro, vec3 rd, float radius) {
+  vec3 oc = ro - SPHERE_CENTER;
+  float b = dot(oc, rd);
+  float c = dot(oc, oc) - radius * radius;
+  float h = b * b - c;
+  if (h < 0.0) return -1.0;
+  float t = -b - sqrt(h);
+  return t > 0.0 ? t : -1.0;
+}
+
+/** 波形が球の半径をどれだけ膨らませるか（半径に対する割合） */
+const float SPHERE_SWING = 0.10;
+
+/** 波形が表面の高さ場へどれだけ効くか。縦に走る畝になる */
+const float SPHERE_RIB = 0.42;
+
+/** 輪の i 番目。4 点ずつ vec4 に詰めてあるので、割った先の成分を引く */
+float waveSample(int i) {
+  return uWave[i >> 2][i & 3];
+}
+
+/**
+ * その向きの波形の値。-1..1。
+ *
+ * 縦軸まわりの角度（経度）で輪を引く。以前のリングが画面上の角度で輪を
+ * 引いていたのと同じもので、平面が球になったぶん、輪は赤道に沿って回る。
+ *
+ * 真上と真下では経度が定まらないので、極へ近づくほど細める。細めないと、
+ * 極の一点で輪の全部の値がぶつかって、そこだけがちらつく。
+ *
+ * 隣り合う 2 点を 3t^2-2t^3 で混ぜているのは、この値を微分して法線を作るため。
+ * 素直な直線補間だと傾きが 128 か所で飛び、球が多面体に見える。
+ */
+float waveAt(vec3 q) {
+  // 極では経度が定まらない。atan(0, 0) は仕様上結果が決まっておらず、
+  // 実装によっては NaN が返る。下の細めは 0 を掛けるだけなので NaN は消せない
+  // （NaN * 0 は NaN）。ここで先に逃がす
+  float around = length(q.xz);
+  if (around < 1e-6) return 0.0;
+
+  float lon = atan(q.z, q.x) / TAU + 0.5;
+  float pos = lon * float(WAVE_POINTS);
+
+  int i0 = int(pos) % WAVE_POINTS;
+  int i1 = (i0 + 1) % WAVE_POINTS;
+  float f = fract(pos);
+
+  float value = mix(waveSample(i0), waveSample(i1), f * f * (3.0 - 2.0 * f));
+  // -1..1 に収める。JS 側は tanh に息づかいを足すので、わずかに 1 を超えて届く。
+  // 下の交差判定はこの値域を前提に球の外接を決めているので、ここで頭を揃える
+  value = clamp(value, -1.0, 1.0);
+  // 極からの遠さ。赤道で 1、真上と真下で 0
+  return value * around;
+}
+
+/** その向きでの球の半径。波形のぶんだけ膨らむ */
+float sphereRadiusAt(vec3 q) {
+  return SPHERE_RADIUS * (1.0 + waveAt(q) * SPHERE_SWING);
+}
+
+/**
+ * 波形で膨らんだ球との交差。当たった向き（中心から見た単位ベクトル）を hitDir へ。
+ *
+ * 半径が向きで変わるので、二次方程式ひとつでは解けない。輪郭の形を決めているのは
+ * 「視線が中心にいちばん近づく点の向き」なので、まずそこの半径で球を切り、
+ * 出てきた交点の向きでもう一度切り直す。膨らみが半径の 1 割ほどなら、
+ * この 2 回でほぼ収まる（レイマーチせずに済む）。
+ */
+float sphereSurfaceHit(vec3 ro, vec3 rd, out vec3 hitDir) {
+  // 膨らみきった大きさの球で先に外す。水面の反射からもこの判定を通すので、
+  // 画面のほとんどを占める「球に当たらない視線」をここで安く落とす
+  if (sphereHit(ro, rd, SPHERE_RADIUS * (1.0 + SPHERE_SWING)) < 0.0) return -1.0;
+
+  vec3 oc = ro - SPHERE_CENTER;
+  // 中心から、視線がいちばん近づく点へ。輪郭はこの向きの半径で決まる
+  vec3 near = oc - dot(oc, rd) * rd;
+  float span = length(near);
+  // 中心をまっすぐ貫く視線だけは向きが定まらない。そこは輪郭から最も遠いので、
+  // どの向きを充てても輪郭は変わらない
+  vec3 edgeDir = span > 1e-4 ? near / span : vec3(1.0, 0.0, 0.0);
+
+  float t = sphereHit(ro, rd, sphereRadiusAt(edgeDir));
+  if (t < 0.0) return -1.0;
+
+  hitDir = normalize(ro + rd * t - SPHERE_CENTER);
+
+  // 切り直した半径の方が小さいと、視線がその球を外すことがある。そこで
+  // 「当たらなかった」を返すと、輪郭の内側に穴が空いて縁が二重に見える。
+  // 一度当たっている以上、表面はそこにある。外れた時は 1 段目をそのまま使う
+  float refined = sphereHit(ro, rd, sphereRadiusAt(hitDir));
+  if (refined <= 0.0) return t;
+
+  hitDir = normalize(ro + rd * refined - SPHERE_CENTER);
+  return refined;
+}
+
+/** 表面の縞の細かさ。単位球のうえで、上下方向に何周ぶん並ぶか */
+const float SPHERE_BAND_FREQ = 21.0;
+
+/** 縞を押し流す歪みの細かさ */
+const float SPHERE_WARP_FREQ = 2.1;
+
+/** 法線をどれだけ曲げるか。大きいほど表面が荒れる */
+const float SPHERE_WAVE_AMP = 0.55;
+
+/** 光った波頭の明るさ */
+const float SPHERE_GLOW = 0.78;
+
+/** 月を返した波頭の、鋭い光の強さ */
+const float SPHERE_SPEC = 1.60;
+
+/**
+ * 球の表面の波。q は中心から見た単位ベクトル（半径 1 の球の上の点）。
+ *
+ * 二つを重ねている。
+ *
+ *   1. `fbm3` のうねり — ゆっくり流れる、大きな起伏
+ *   2. 緯度に沿った縞 — そのうねりで押し曲げられ、まっすぐな輪ではなく
+ *      流れになる
+ *
+ * 縞を ((sin+1)/2)^2 で尖らせているのは水面と同じ理由で、山が細く立ち、
+ * 谷が広く平らになる。正弦波のままだと山と谷が同じ形になり、水よりゼリーに見える。
+ *
+ * 返すのは二つ。x が高さ（法線を曲げるのに使う）、y が縞の山だけを取り出した値
+ * （光り方に使う）。うねりまで光らせると、縞が滲んで模様に見えなくなる。
+ *
+ * 時刻に係数を掛けないこと（uTime は既にフレーム差分の積み上げで、
+ * `prefers-reduced-motion` のぶんも入っている）。
+ */
+vec2 sphereWave(vec3 q) {
+  // 座標そのものを時間で流す。模様が形を保ったまま表面を巡る
+  vec3 drift = vec3(uTime * 0.05, uTime * 0.09, uTime * 0.04);
+  float swell = fbm3(q * SPHERE_WARP_FREQ + drift);
+
+  // 押し曲げる量は縞の細かさに対して控えめにする。強く曲げすぎると
+  // 縞が千切れて、ただのまだら模様になる
+  float bands = sin(q.y * SPHERE_BAND_FREQ + swell * 4.2 - uTime * 0.6);
+  float ridge = (bands + 1.0) * 0.5;
+  ridge *= ridge;
+
+  // 波形の畝。縞が緯度に沿って回るのに対して、こちらは経度に沿って縦に走る。
+  // 交差判定でも同じ値で球を膨らませてあるので、輪郭と表面の陰が食い違わない
+  float rib = waveAt(q) * SPHERE_RIB;
+
+  return vec2(ridge * 0.5 + swell * 0.6 + rib, ridge);
+}
+
+/**
+ * 波で曲げた法線。
+ *
+ * 形そのものは動かさず、傾きだけを差し替える（水面と同じ）。高さ場の勾配は
+ * 正四面体の 4 点で近似する。中心を含めた 6 点の差分より 2 回ぶん安い。
+ *
+ * 勾配のうち **法線方向の成分は落とす**。その向きは球を膨らませたり
+ * へこませたりするだけで、面の傾きを変えない＝模様として見えない。
+ */
+vec3 sphereNormal(vec3 q, float amp) {
+  const vec2 e = vec2(1.0, -1.0) * 0.016;
+  vec3 grad = e.xyy * sphereWave(q + e.xyy).x
+            + e.yyx * sphereWave(q + e.yyx).x
+            + e.yxy * sphereWave(q + e.yxy).x
+            + e.xxx * sphereWave(q + e.xxx).x;
+
+  // q は単位ベクトルなので、内積を引くだけで接平面へ落ちる
+  vec3 slope = grad - dot(grad, q) * q;
+  return normalize(q - slope * amp);
+}
+
+/**
+ * 球に当たった視線の色。
+ *
+ * 水面と同じ組み立て方をしている。法線を求め、視線を反射させ、その方向の空を
+ * skyColor() で引き、フレネルで球そのものの色と混ぜる。同じ関数から色が来るので、
+ * 球と水面はひとりでに同じ夜を映す。波頭が月を返した所だけが白く光る。
+ */
+vec3 sphereColor(vec3 rd, vec3 q, float surfaceBlur) {
+  // 低域が厚いほど表面が荒れる。以前のリングが低域で脈打っていたのと同じ役目
+  float amp = SPHERE_WAVE_AMP * (0.80 + uLow * 0.60);
+  vec3 normal = sphereNormal(q, amp);
+  // 縞の山。傾き（法線）とは別に、どこが光るかを決める
+  float crest = sphereWave(q).y;
+
+  // 面が完全に滑らかだと、月がひとつの点に凝って刺さる。水面と同じく、
+  // 1 ピクセルに収まりきらない細かさぶんだけ滲ませておく。
+  // surfaceBlur は、水面の反射としてこの球を見ている時に、その水面が
+  // 捨てた細かさが入ってくる（直接見ている時は 0）
+  float blur = 0.008 + amp * 0.020 + surfaceBlur;
+
+  vec3 reflected = reflect(rd, normal);
+  vec3 col = mix(SPHERE_BODY, skyColor(reflected, blur), fresnel(-rd, normal));
+
+  // 波頭が光る。
+  //
+  // 鏡の反射だけに任せると、正面を向いた面は空の暗いところを返して真っ黒になり、
+  // 波模様がどこにも出てこない。かといって物体として照らすと、月は球の
+  // 向こう側にあるので、こちらを向いた面はどれも同じ明るさになって平たく見える。
+  //
+  // 山だけを抜き出して光らせ、月の側ほど強くする。谷は暗いまま残るので、
+  // 光った山が線になって表面を流れる。ブルームの前の段なので、この線は滲む。
+  float ridge = smoothstep(0.50, 1.0, crest);
+  // 法線が月を向くほど強い。0..1 に均してあるので、裏を向いた面も沈むだけで消えない
+  float toward = 0.18 + 0.82 * (dot(normal, uMoonDir) * 0.5 + 0.5);
+  // 縁ほど強い。視線に対して面が寝ている所ほど、波を横から見ることになる。
+  // これが無いと、光った縞が平らな板に描いた模様のように見えて丸みが出ない
+  float limb = pow(1.0 - abs(dot(rd, q)), 1.4);
+  col += MOON_TINT * ridge * toward * (0.28 + 0.72 * limb) * SPHERE_GLOW * (0.85 + uLow * 0.50);
+
+  // 波頭が月を返す鋭い光。月と視線のちょうど真ん中を向いた面だけが光るので、
+  // 表面のうねりに合わせて光の位置が動き、模様が生きて見える
+  vec3 halfway = normalize(uMoonDir - rd);
+  float spec = pow(max(dot(normal, halfway), 0.0), 22.0);
+  // 遠い水面に映った球では、この鋭い光が 1 ピクセルに収まらない。そのまま
+  // 映すと、水平線寄りで反射像が砂嵐のようにちらつく
+  col += MOON_TINT * spec * SPHERE_SPEC / (1.0 + surfaceBlur * 60.0);
+
+  return col;
+}
+
 // ---- 仕上げ ----------------------------------------------------------------
 //
 // ビネットとディザは、この後のブルームを重ねてからでないと意味がない。
@@ -359,13 +677,21 @@ void main() {
 
   // 視線。uv.y が uHorizon のところで水平になる
   vec3 rd = normalize(vec3(uv.x, uv.y - uHorizon, -1.0));
+  vec3 ro = vec3(0.0, uEyeHeight, 0.0);
   vec3 col;
 
-  if (rd.y >= 0.0) {
+  // 球は丸ごと水面より上にあるので、当たったならそれは必ず水面より手前。
+  // 距離を比べるまでもなく、球を先に見てよい
+  vec3 sphereDir;
+  float tSphere = sphereSurfaceHit(ro, rd, sphereDir);
+
+  if (tSphere > 0.0) {
+    col = sphereColor(rd, sphereDir, 0.0);
+  } else if (rd.y >= 0.0) {
     col = skyColor(rd, 0.0);
   } else {
     float dist = min(uEyeHeight / -rd.y, MAX_DISTANCE);
-    vec3 hit = vec3(0.0, uEyeHeight, 0.0) + rd * dist;
+    vec3 hit = ro + rd * dist;
 
     float blur;
     vec3 normal = waterSurface(hit.xz, dist, blur);
@@ -373,11 +699,19 @@ void main() {
     vec3 reflected = reflect(rd, normal);
     // 波が急なところでは反射が下を向く。水面下は写せないので折り返す
     reflected.y = abs(reflected.y);
+    reflected = normalize(reflected);
 
     // 水そのものの色。手前ほど視線が立って底の暗さが出る
     vec3 body = mix(WATER_FAR, WATER_DEEP, clamp(1.0 / (1.0 + dist * 0.5), 0.0, 1.0));
 
-    col = mix(body, skyColor(normalize(reflected), blur), fresnel(-rd, normal));
+    // 反射した先に球があれば、空ではなく球が映る。水面の一点から見上げた方向を
+    // そのまま飛ばしているので、映り込みは波に合わせて崩れ、球が動けば一緒に動く
+    vec3 mirrorDir;
+    vec3 above = sphereSurfaceHit(hit, reflected, mirrorDir) > 0.0
+      ? sphereColor(reflected, mirrorDir, blur)
+      : skyColor(reflected, blur);
+
+    col = mix(body, above, fresnel(-rd, normal));
   }
 
   // 明るいところを圧縮する。月の芯が真っ白に潰れず、光が丸く残る
