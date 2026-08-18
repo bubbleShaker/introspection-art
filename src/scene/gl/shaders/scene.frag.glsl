@@ -45,7 +45,20 @@ const int MAX_RIPPLES = 12;
 uniform vec4 uRipples[MAX_RIPPLES];
 uniform int uRippleCount;
 
+/** 波形の輪の点の数。waveSphere.ts の WAVE_RING_POINTS と揃える */
+const int WAVE_POINTS = 128;
+
+/**
+ * 球のまわりを一周する波形。4 点ずつ vec4 に詰めてある。
+ *
+ * float を 128 本並べると、実装によっては uniform の本数の上限に触る。
+ * 詰め方は JS 側（waveSphere.ts）が持っていて、ここへは畳んだ結果だけ届く。
+ */
+uniform vec4 uWave[WAVE_POINTS / 4];
+
 out vec4 fragColor;
+
+const float TAU = 6.28318530718;
 
 // ---- 色 --------------------------------------------------------------------
 
@@ -431,14 +444,87 @@ const vec3 SPHERE_BODY = vec3(0.008, 0.014, 0.034);
  * rd は正規化済みなので、二次方程式の a が 1 になって式が短くなる。
  * 内側からの交点（t < 0 の側）は使わない。球の中には入らない。
  */
-float sphereHit(vec3 ro, vec3 rd) {
+float sphereHit(vec3 ro, vec3 rd, float radius) {
   vec3 oc = ro - SPHERE_CENTER;
   float b = dot(oc, rd);
-  float c = dot(oc, oc) - SPHERE_RADIUS * SPHERE_RADIUS;
+  float c = dot(oc, oc) - radius * radius;
   float h = b * b - c;
   if (h < 0.0) return -1.0;
   float t = -b - sqrt(h);
   return t > 0.0 ? t : -1.0;
+}
+
+/** 波形が球の半径をどれだけ膨らませるか（半径に対する割合） */
+const float SPHERE_SWING = 0.10;
+
+/** 波形が表面の高さ場へどれだけ効くか。縦に走る畝になる */
+const float SPHERE_RIB = 0.42;
+
+/** 輪の i 番目。4 点ずつ vec4 に詰めてあるので、割った先の成分を引く */
+float waveSample(int i) {
+  return uWave[i >> 2][i & 3];
+}
+
+/**
+ * その向きの波形の値。-1..1。
+ *
+ * 縦軸まわりの角度（経度）で輪を引く。以前のリングが画面上の角度で輪を
+ * 引いていたのと同じもので、平面が球になったぶん、輪は赤道に沿って回る。
+ *
+ * 真上と真下では経度が定まらないので、極へ近づくほど細める。細めないと、
+ * 極の一点で輪の全部の値がぶつかって、そこだけがちらつく。
+ *
+ * 隣り合う 2 点を 3t^2-2t^3 で混ぜているのは、この値を微分して法線を作るため。
+ * 素直な直線補間だと傾きが 128 か所で飛び、球が多面体に見える。
+ */
+float waveAt(vec3 q) {
+  float lon = atan(q.z, q.x) / TAU + 0.5;
+  float pos = lon * float(WAVE_POINTS);
+
+  int i0 = int(pos) % WAVE_POINTS;
+  int i1 = (i0 + 1) % WAVE_POINTS;
+  float f = fract(pos);
+
+  float value = mix(waveSample(i0), waveSample(i1), f * f * (3.0 - 2.0 * f));
+  // 極からの遠さ。赤道で 1、真上と真下で 0
+  return value * sqrt(max(1.0 - q.y * q.y, 0.0));
+}
+
+/** その向きでの球の半径。波形のぶんだけ膨らむ */
+float sphereRadiusAt(vec3 q) {
+  return SPHERE_RADIUS * (1.0 + waveAt(q) * SPHERE_SWING);
+}
+
+/**
+ * 波形で膨らんだ球との交差。当たった向き（中心から見た単位ベクトル）を hitDir へ。
+ *
+ * 半径が向きで変わるので、二次方程式ひとつでは解けない。輪郭の形を決めているのは
+ * 「視線が中心にいちばん近づく点の向き」なので、まずそこの半径で球を切り、
+ * 出てきた交点の向きでもう一度切り直す。膨らみが半径の 1 割ほどなら、
+ * この 2 回でほぼ収まる（レイマーチせずに済む）。
+ */
+float sphereSurfaceHit(vec3 ro, vec3 rd, out vec3 hitDir) {
+  vec3 oc = ro - SPHERE_CENTER;
+  // 中心から、視線がいちばん近づく点へ。輪郭はこの向きの半径で決まる
+  vec3 near = oc - dot(oc, rd) * rd;
+  float span = length(near);
+  // 中心をまっすぐ貫く視線だけは向きが定まらない。そこは輪郭から最も遠いので、
+  // どの向きを充てても輪郭は変わらない
+  vec3 edgeDir = span > 1e-4 ? near / span : vec3(1.0, 0.0, 0.0);
+
+  float t = sphereHit(ro, rd, sphereRadiusAt(edgeDir));
+  if (t < 0.0) return -1.0;
+
+  hitDir = normalize(ro + rd * t - SPHERE_CENTER);
+
+  // 切り直した半径の方が小さいと、視線がその球を外すことがある。そこで
+  // 「当たらなかった」を返すと、輪郭の内側に穴が空いて縁が二重に見える。
+  // 一度当たっている以上、表面はそこにある。外れた時は 1 段目をそのまま使う
+  float refined = sphereHit(ro, rd, sphereRadiusAt(hitDir));
+  if (refined <= 0.0) return t;
+
+  hitDir = normalize(ro + rd * refined - SPHERE_CENTER);
+  return refined;
 }
 
 /** 表面の縞の細かさ。単位球のうえで、上下方向に何周ぶん並ぶか */
@@ -485,7 +571,11 @@ vec2 sphereWave(vec3 q) {
   float ridge = (bands + 1.0) * 0.5;
   ridge *= ridge;
 
-  return vec2(ridge * 0.5 + swell * 0.6, ridge);
+  // 波形の畝。縞が緯度に沿って回るのに対して、こちらは経度に沿って縦に走る。
+  // 交差判定でも同じ値で球を膨らませてあるので、輪郭と表面の陰が食い違わない
+  float rib = waveAt(q) * SPHERE_RIB;
+
+  return vec2(ridge * 0.5 + swell * 0.6 + rib, ridge);
 }
 
 /**
@@ -516,11 +606,7 @@ vec3 sphereNormal(vec3 q, float amp) {
  * skyColor() で引き、フレネルで球そのものの色と混ぜる。同じ関数から色が来るので、
  * 球と水面はひとりでに同じ夜を映す。波頭が月を返した所だけが白く光る。
  */
-vec3 sphereColor(vec3 ro, vec3 rd, float t) {
-  vec3 p = ro + rd * t;
-  // 単位球のうえの点に直す。半径を変えても模様の細かさが変わらない
-  vec3 q = (p - SPHERE_CENTER) / SPHERE_RADIUS;
-
+vec3 sphereColor(vec3 rd, vec3 q) {
   float amp = SPHERE_WAVE_AMP;
   vec3 normal = sphereNormal(q, amp);
   // 縞の山。傾き（法線）とは別に、どこが光るかを決める
@@ -574,10 +660,11 @@ void main() {
 
   // 球は丸ごと水面より上にあるので、当たったならそれは必ず水面より手前。
   // 距離を比べるまでもなく、球を先に見てよい
-  float tSphere = sphereHit(ro, rd);
+  vec3 sphereDir;
+  float tSphere = sphereSurfaceHit(ro, rd, sphereDir);
 
   if (tSphere > 0.0) {
-    col = sphereColor(ro, rd, tSphere);
+    col = sphereColor(rd, sphereDir);
   } else if (rd.y >= 0.0) {
     col = skyColor(rd, 0.0);
   } else {

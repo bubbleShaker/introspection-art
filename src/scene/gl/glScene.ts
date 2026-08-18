@@ -1,7 +1,7 @@
 import p5 from 'p5'
 import type { Levels } from '../../core/levels.ts'
 import { opacityRatio, progress, radiusRatio, RippleField } from '../ripples.ts'
-import { ringPointCount, traceWaveRing } from '../waveRing.ts'
+import { packWaveRing, WAVE_RING_POINTS } from '../waveSphere.ts'
 import { EYE_HEIGHT, HORIZON_UV, moonDirection, waterPointAt } from './camera.ts'
 import { QualityGovernor } from './quality.ts'
 import bloomSource from './shaders/bloom.frag.glsl?raw'
@@ -36,24 +36,6 @@ const BLOOM_DOWNSCALE = 2
 
 /** 滲みをどれくらい広げるか（元絵の画素数） */
 const BLOOM_RADIUS = 26
-
-/** 波形のリングの基準半径。画面の短い方の辺に対する割合 */
-const WAVE_RADIUS_RATIO = 0.22
-
-/** 波形が半径をどれだけ揺らすか（基準半径に対する割合） */
-const WAVE_SWING = 0.22
-
-/**
- * リングの線。太く薄い → 細く濃いの順に重ねて、白の芯とにじみを作る。
- * 逆にすると、にじみが芯を覆って濁る。
- *
- * 太さはキャンバスの座標（CSS ピクセル）で数える。画素の細かさを掛けては
- * いけない（画質を落とした端末で線だけ細くなる）。
- */
-const WAVE_LAYERS = [
-  { weight: 7, alpha: 26 },
-  { weight: 1.6, alpha: 232 },
-] as const
 
 /**
  * この端末で描けるか。
@@ -113,18 +95,12 @@ export class GlWaterScene {
   private readonly levels: Levels = { low: 0, mid: 0, high: 0 }
 
   /**
-   * 描く時に読む波形。levels と同じ理由で、渡されたものを写して持つ。
+   * 球のまわりを一周する波形。シェーダーへ渡す形に畳んだもの。
    *
-   * 長さは呼び出し側が決める（音声側の都合なので、こちらは点の数を知らない）。
-   * 最初に渡された時に合わせて用意する。
+   * levels と同じで、渡された配列は持たずに値を写す。向こうは毎フレーム同じ
+   * 配列を書き換えて使い回しているので、参照で持つと「いつ読むか」に絵が左右される。
    */
-  private wave = new Float32Array(0)
-
-  /** リングの点（x, y の交互）。毎フレーム作り直さず、詰め替える */
-  private ringPoints = new Float32Array(0)
-
-  /** リングだけ描けなくなった。背景は続ける */
-  private ringBroken = false
+  private readonly waveRing = new Float32Array(WAVE_RING_POINTS)
 
   private readonly ripples = new RippleField()
   /** 波紋をシェーダーへ渡すための入れ物。毎フレーム作り直さず、詰め替える */
@@ -235,7 +211,7 @@ export class GlWaterScene {
    * 1 フレーム描く。
    *
    * @param levels 帯域ごとの強さ（水面と空が読む）
-   * @param wave 時間領域の波形 -1..1（手前のリングが読む）
+   * @param wave 時間領域の波形 -1..1（球の表面が読む）
    * @param nowMs 今の時刻
    */
   draw(levels: Levels, wave: Float32Array, nowMs: number): void {
@@ -260,8 +236,7 @@ export class GlWaterScene {
     this.levels.mid = levels.mid
     this.levels.high = levels.high
 
-    if (this.wave.length !== wave.length) this.wave = new Float32Array(wave.length)
-    this.wave.set(wave)
+    packWaveRing(wave, this.time, this.waveRing)
 
     // p5 2.x の redraw は async。中で投げられたものは reject として出てくるので、
     // ここでも拾わないと unhandled rejection が毎フレーム積み上がる
@@ -359,7 +334,6 @@ export class GlWaterScene {
    *   1. シーンを面へ描く
    *   2. その明るいところだけを集め、粗い面でぼかす
    *   3. 二つを重ねて画面へ出す
-   *   4. その上に、波形のリングを線で描く
    *
    * 滲みを作るには一度出来上がった絵が要るので、直接画面へは描けない。
    */
@@ -385,6 +359,7 @@ export class GlWaterScene {
       scene.setUniform('uHorizon', HORIZON_UV)
       scene.setUniform('uMotion', this.motion)
       scene.setUniform('uEyeHeight', EYE_HEIGHT)
+      scene.setUniform('uWave', this.waveRing)
       scene.setUniform('uRipples', this.rippleBuffer)
       scene.setUniform('uRippleCount', this.rippleCount)
       scene.setUniform('uMoonDir', moonDirection(this.moonX, this.aspect()))
@@ -413,64 +388,6 @@ export class GlWaterScene {
       return
     }
 
-    // リングは背景の上に足した飾りなので、ここで転んでも背景は続ける。
-    // 同じ try に入れると、線 1 本のために画面ごと落ちて真っ暗になる
-    if (this.ringBroken) return
-    try {
-      this.drawWaveRing(sketch)
-    } catch (error) {
-      this.ringBroken = true
-      console.error('[introspection-art] 波形のリングを描けません', error)
-    }
-  }
-
-  /**
-   * 手前の白いリング。音の波形をそのまま円周に巻きつけたもの。
-   *
-   * 背景（シェーダー 3 パス）が終わったあとに、p5 の既定の描き方へ戻して線を引く。
-   * ここだけシェーダーを使わないのは、線 1 本のために板とテクスチャを一往復
-   * させる理由が無いため。滲みの段より後ろなので、この線に bloom は乗らない。
-   * 白の芯とにじみは、太く薄い線と細く濃い線の二度描きで作る。
-   */
-  private drawWaveRing(sketch: p5): void {
-    const wave = this.wave
-    if (wave.length < 2) return
-
-    const short = Math.min(sketch.width, sketch.height)
-    // 低域で軽く息をする。大きく脈打たせると、背景の静けさから浮く
-    const radius = short * WAVE_RADIUS_RATIO * (1 + this.levels.low * 0.06)
-    // 動きを抑える設定でも、輪が固まってしまわない程度には振らせる
-    const swing = radius * WAVE_SWING * (0.4 + 0.6 * this.motion)
-
-    // 点は一度だけ出して、二本の線で使い回す。層ごとに数え直すと、
-    // sin と cos を 1 フレームに二度ぶん回すことになる
-    const needed = ringPointCount(wave.length) * 2
-    if (this.ringPoints.length !== needed) this.ringPoints = new Float32Array(needed)
-    const points = traceWaveRing(wave, radius, swing, this.time, this.ringPoints)
-
-    // 板にシェーダーを貼ったままなので、p5 の既定の描き方へ戻す。線そのものは
-    // 別のシェーダー（line shader）で描かれるため貼りっぱなしでも塗りは移らないが、
-    // 描き方の状態を持ち越さない方が、あとで塗りを足した時に驚かない
-    sketch.resetShader()
-
-    sketch.push()
-    // 背景の板から 1 単位ぶん離す。p5 は深度を毎フレーム消し、同じ深さなら
-    // 後から描いた方が上に出るので必須ではないが、描き順に頼らずに済む
-    // （既定のカメラでは 1 単位 ≒ 1px なので、絵の大きさは変わらない）
-    sketch.translate(0, 0, 1)
-    sketch.noFill()
-
-    for (const layer of WAVE_LAYERS) {
-      sketch.strokeWeight(layer.weight)
-      sketch.stroke(255, layer.alpha)
-      sketch.beginShape()
-      for (let i = 0; i < points; i++) {
-        sketch.vertex(this.ringPoints[i * 2], this.ringPoints[i * 2 + 1])
-      }
-      sketch.endShape(sketch.CLOSE)
-    }
-
-    sketch.pop()
   }
 
   /** 画面の横 / 縦 */
