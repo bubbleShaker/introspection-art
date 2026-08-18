@@ -504,6 +504,10 @@ float sphereRadiusAt(vec3 q) {
  * この 2 回でほぼ収まる（レイマーチせずに済む）。
  */
 float sphereSurfaceHit(vec3 ro, vec3 rd, out vec3 hitDir) {
+  // 膨らみきった大きさの球で先に外す。水面の反射からもこの判定を通すので、
+  // 画面のほとんどを占める「球に当たらない視線」をここで安く落とす
+  if (sphereHit(ro, rd, SPHERE_RADIUS * (1.0 + SPHERE_SWING)) < 0.0) return -1.0;
+
   vec3 oc = ro - SPHERE_CENTER;
   // 中心から、視線がいちばん近づく点へ。輪郭はこの向きの半径で決まる
   vec3 near = oc - dot(oc, rd) * rd;
@@ -537,7 +541,7 @@ const float SPHERE_WARP_FREQ = 2.1;
 const float SPHERE_WAVE_AMP = 0.55;
 
 /** 光った波頭の明るさ */
-const float SPHERE_GLOW = 0.60;
+const float SPHERE_GLOW = 0.78;
 
 /** 月を返した波頭の、鋭い光の強さ */
 const float SPHERE_SPEC = 1.60;
@@ -567,7 +571,7 @@ vec2 sphereWave(vec3 q) {
 
   // 押し曲げる量は縞の細かさに対して控えめにする。強く曲げすぎると
   // 縞が千切れて、ただのまだら模様になる
-  float bands = sin(q.y * SPHERE_BAND_FREQ + swell * 3.4 - uTime * 0.6);
+  float bands = sin(q.y * SPHERE_BAND_FREQ + swell * 4.2 - uTime * 0.6);
   float ridge = (bands + 1.0) * 0.5;
   ridge *= ridge;
 
@@ -607,7 +611,8 @@ vec3 sphereNormal(vec3 q, float amp) {
  * 球と水面はひとりでに同じ夜を映す。波頭が月を返した所だけが白く光る。
  */
 vec3 sphereColor(vec3 rd, vec3 q) {
-  float amp = SPHERE_WAVE_AMP;
+  // 低域が厚いほど表面が荒れる。以前のリングが低域で脈打っていたのと同じ役目
+  float amp = SPHERE_WAVE_AMP * (0.80 + uLow * 0.60);
   vec3 normal = sphereNormal(q, amp);
   // 縞の山。傾き（法線）とは別に、どこが光るかを決める
   float crest = sphereWave(q).y;
@@ -633,7 +638,7 @@ vec3 sphereColor(vec3 rd, vec3 q) {
   // 縁ほど強い。視線に対して面が寝ている所ほど、波を横から見ることになる。
   // これが無いと、光った縞が平らな板に描いた模様のように見えて丸みが出ない
   float limb = pow(1.0 - abs(dot(rd, q)), 1.4);
-  col += MOON_TINT * ridge * toward * (0.28 + 0.72 * limb) * SPHERE_GLOW;
+  col += MOON_TINT * ridge * toward * (0.28 + 0.72 * limb) * SPHERE_GLOW * (0.85 + uLow * 0.50);
 
   // 波頭が月を返す鋭い光。月と視線のちょうど真ん中を向いた面だけが光るので、
   // 表面のうねりに合わせて光の位置が動き、模様が生きて見える
@@ -677,11 +682,19 @@ void main() {
     vec3 reflected = reflect(rd, normal);
     // 波が急なところでは反射が下を向く。水面下は写せないので折り返す
     reflected.y = abs(reflected.y);
+    reflected = normalize(reflected);
 
     // 水そのものの色。手前ほど視線が立って底の暗さが出る
     vec3 body = mix(WATER_FAR, WATER_DEEP, clamp(1.0 / (1.0 + dist * 0.5), 0.0, 1.0));
 
-    col = mix(body, skyColor(normalize(reflected), blur), fresnel(-rd, normal));
+    // 反射した先に球があれば、空ではなく球が映る。水面の一点から見上げた方向を
+    // そのまま飛ばしているので、映り込みは波に合わせて崩れ、球が動けば一緒に動く
+    vec3 mirrorDir;
+    vec3 above = sphereSurfaceHit(hit, reflected, mirrorDir) > 0.0
+      ? sphereColor(reflected, mirrorDir)
+      : skyColor(reflected, blur);
+
+    col = mix(body, above, fresnel(-rd, normal));
   }
 
   // 明るいところを圧縮する。月の芯が真っ白に潰れず、光が丸く残る
