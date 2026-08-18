@@ -142,9 +142,9 @@ float valueNoise3(vec3 p) {
  * 3 次元の fbm。段数は 3 で止めてある。
  *
  * 球の格子を押し曲げるうねりに使う（下の wireCoverage を参照）。1 回で 24 回の
- * hash を引き、wireCoverage は 1 ピクセルにつき最大 4 回呼ばれる
- * （表と裏 × 直に見る場合と水面の反射）。空の fbm と同じ 5 段にすると 1 回で
- * 40 回になり、そこだけで 1 ピクセルあたり 160 回の hash になる。
+ * hash を引き、wireCoverage は 1 ピクセルにつき最大 2 回呼ばれる（表と裏）。
+ * 空の fbm と同じ 5 段にすると 1 回で 40 回になり、そこだけで 1 ピクセルあたり
+ * 80 回の hash になる。
  */
 float fbm3(vec3 p) {
   float sum = 0.0;
@@ -441,7 +441,12 @@ const float SPHERE_FORWARD = 3.6;
  */
 const float SPHERE_RADIUS = 0.62;
 
-/** 水面からどれだけ浮いているか。球の下端と水平線のあいだを空ける */
+/**
+ * 水面からどれだけ浮いているか。
+ *
+ * 水面へ映らなくなった今、これは画面上の高さを決めるだけの値になっている
+ * （球は水平線を跨いでいて、下半分は海を背にしている）。
+ */
 const float SPHERE_HOVER = 0.22;
 
 const vec3 SPHERE_CENTER = vec3(0.0, SPHERE_HOVER + SPHERE_RADIUS, -SPHERE_FORWARD);
@@ -596,21 +601,12 @@ const float WIRE_BACK = 0.35;
  * 長さへ直してから比べる。
  *
  * @param aa 滲ませる幅。0 だと smoothstep の両端が重なって結果が定まらない
+ * @param fade 潰れた線をどれだけ薄めるか。1 で素のまま
  */
-float wireLine(float coord, float spacing, float aa) {
+float wireLine(float coord, float spacing, float aa, float fade) {
   // 最寄りの線までの隔たり（座標の単位）を、球面上の長さに直す
   float d = abs(fract(coord + 0.5) - 0.5) * spacing;
-  float line = 1.0 - smoothstep(WIRE_WIDTH, WIRE_WIDTH + aa, d);
-
-  // 滲みが線の太さを超えたら、超えたぶんだけ薄める。
-  //
-  // 滲ませるだけだと、線は画面上でいくら細っても真芯の濃さを保ってしまう。
-  // 極や輪郭のように線が潰れて重なるところで、白い塊に固まる原因になる。
-  // 縮んだ絵を薄くするのは、縮小して重ねる時の当たり前の作法でもある。
-  //
-  // 潰れきったら消える。以前は輪郭を薄い帯として残していたが、線ではなく
-  // 面の気配になってしまう。線だけで形を出すなら、見えない線は消してよい
-  return line * min(1.0, WIRE_WIDTH * 3.0 / max(aa, 1e-5));
+  return (1.0 - smoothstep(WIRE_WIDTH, WIRE_WIDTH + aa, d)) * fade;
 }
 
 /**
@@ -619,9 +615,14 @@ float wireLine(float coord, float spacing, float aa) {
  *
  * 線の太さは球面上の長さで決めているので、球を斜めから見るところでは
  * 画面上でどんどん細くなり、輪郭では 1 ピクセルを割って点滅する。
- * そこで、1 ピクセルがこの面をどれだけ覆うかを距離と傾きから出し、
- * その幅だけ滲ませる。ここで滲ませるのは階段を消すためで、絵として
- * ぼかしたいわけではない。輪郭で潰れた線は、滲ませずに薄れて消える。
+ *
+ * 手当ては二つに分けてある。**滲ませる幅（aa）と、薄める量（fade）は別物**。
+ *
+ *   - aa は階段を消すためだけのもの。実際の潰れ具合に比例させると、輪郭で
+ *     線が大きくぼやけて帯になる（線ではなく面の気配になってしまう）ので、
+ *     1 ピクセルの数倍で頭を押さえる
+ *   - fade は「1 ピクセルに収まらなくなった線は、そのぶん薄い」という縮小の
+ *     作法。こちらは頭を押さえない。潰れきった線は滲まずに消える
  *
  * 時刻に係数を掛けないこと（uTime は既にフレーム差分の積み上げで、
  * `prefers-reduced-motion` のぶんも入っている）。
@@ -631,9 +632,12 @@ float wireCoverage(vec3 rd, vec3 q, float t) {
   // 正規化してあるので、1 ピクセルの見込み角は 1 / uResolution.y になる
   float spread = t / (uResolution.y * SPHERE_RADIUS);
   // 面が視線に対して寝ているほど、同じ 1 ピクセルが表面を広く覆う。
-  // 輪郭では発散するので、頭を押さえる。0.30 は 0.12 より強い頭打ちで、
-  // 輪郭の線がぼやけて帯になる前に、薄れて消える側へ倒している
-  float aa = spread / max(abs(dot(rd, q)), 0.30);
+  // 輪郭では発散するので、0 割りにならない程度にだけ止める
+  float grazing = spread / max(abs(dot(rd, q)), 0.03);
+  // 滲ませるのは階段を消すぶんまで
+  float aa = min(grazing, spread * 3.0);
+  // 潰れて太さを割った線は、滲ませずに濃さで落とす
+  float fade = min(1.0, WIRE_WIDTH * 3.0 / grazing);
 
   // 縦軸からの遠さ。赤道で 1、真上と真下で 0
   float around = length(q.xz);
@@ -649,7 +653,9 @@ float wireCoverage(vec3 rd, vec3 q, float t) {
   // （膨らみは半径の向き、こちらは緯度の向きで、動く向きは違う）
   float lat = asin(clamp(q.y, -1.0, 1.0)) / PI;
   float latCoord = lat * WIRE_PARALLELS + waveAt(q) * WIRE_RIB + swell * 0.5;
-  float parallels = wireLine(latCoord, PI / WIRE_PARALLELS, aa);
+  // 極のすぐ際の緯線は、輪が点に縮んで画面では白い粒にしかならない。落とす
+  float parallels = wireLine(latCoord, PI / WIRE_PARALLELS, aa, fade)
+                  * smoothstep(0.0, 0.10, around);
 
   // 経線。極へ寄るほど隣との間隔が詰まって潰れるので、そこは薄めて逃がす。
   //
@@ -661,7 +667,7 @@ float wireCoverage(vec3 rd, vec3 q, float t) {
   if (around > 1e-6) {
     float lon = atan(q.z, q.x) / TAU;
     float lonCoord = lon * WIRE_MERIDIANS + swell * 0.4;
-    meridians = wireLine(lonCoord, TAU * around / WIRE_MERIDIANS, aa)
+    meridians = wireLine(lonCoord, TAU * around / WIRE_MERIDIANS, aa, fade)
               * smoothstep(0.06, 0.45, around);
   }
 
@@ -694,7 +700,8 @@ float sphereWire(vec3 ro, vec3 rd) {
   // 「球に当たらない視線」をここで安く落とす。
   //
   // 見ているのは手前の根だけなので、目がこの外接球の内側に入ると球が丸ごと
-  // 消える。SPHERE_HOVER や目の高さを動かす時はここが効いてくる
+  // 消える。効くのは目から球心までの距離（ほぼ SPHERE_FORWARD = 3.6）で、
+  // 外接半径 0.69 とは桁が違う。SPHERE_FORWARD を大きく詰める時は見ること
   if (sphereHit(ro, rd, SPHERE_RADIUS * (1.0 + SPHERE_SWING), false) < 0.0) return 0.0;
 
   float back = wireLayer(ro, rd, true) * WIRE_BACK;
