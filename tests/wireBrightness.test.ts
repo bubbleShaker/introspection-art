@@ -23,7 +23,11 @@ describe('線とブルームの取り決め', () => {
     const threshold = constantOf(bloomSource, /const float THRESHOLD = ([\d.]+);/)
 
     // scene.frag の最後で col / (1 + col) に圧縮される。無彩色なので、
-    // bloom.frag が測る輝度（重みの総和が 1）はこの値そのものになる
+    // bloom.frag が測る輝度（重みの総和が 1）はこの値そのものになる。
+    //
+    // 線は WIRE_ALPHA で半透明になったので、実際に画面へ出るのは背景と
+    // 混ざった色であり、この値より必ず暗い。ここで押さえているのは
+    // 「いちばん濃く出たとしても届かない」という上限の側
     const luma = wire / (1 + wire)
 
     expect(luma).toBeLessThan(threshold)

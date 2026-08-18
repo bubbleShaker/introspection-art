@@ -38,6 +38,22 @@ const BLOOM_DOWNSCALE = 2
 const BLOOM_RADIUS = 26
 
 /**
+ * 球の格子が、無音でも回り続ける速さ（秒あたり）。
+ *
+ * 回し切っているのは視線の軸まわりだけで、その角度はシェーダー側
+ * （scene.frag.glsl の spinMatrix）で `uSpin * 0.30` になる。無音では
+ * ひと回りに 2π / (0.5 * 0.30) ≒ 42 秒。曲の静けさに対して、これ以上速いと
+ * 落ち着かない。
+ *
+ * この 42 秒は**二つのファイルに跨がって**決まる。片方だけ動かしても例外は
+ * 出ないので、tests/spinPeriod.test.ts が突き合わせている。
+ */
+const SPIN_IDLE = 0.5
+
+/** 低域がいっぱいの時に、この量だけ上乗せされる */
+const SPIN_GAIN = 1.1
+
+/**
  * この端末で描けるか。
  *
  * シェーダーを GLSL ES 3.00 で書いているので WebGL2 が要る。無い環境では
@@ -127,6 +143,9 @@ export class GlWaterScene {
   /** 月が漂った量（秒）。時刻に係数を掛けないのは上と同じ理由 */
   private moonDrift = 0
 
+  /** 球の格子が回った量（秒）。時刻に係数を掛けないのは上と同じ理由 */
+  private spin = 0
+
   constructor(
     container: HTMLElement,
     options: { random?: () => number; reducedMotion?: boolean } = {},
@@ -211,7 +230,7 @@ export class GlWaterScene {
    * 1 フレーム描く。
    *
    * @param levels 帯域ごとの強さ（水面と空が読む）
-   * @param wave 時間領域の波形 -1..1（球の表面が読む）
+   * @param wave 時間領域の波形 -1..1（球の格子の、線の濃さが読む）
    * @param nowMs 今の時刻
    */
   draw(levels: Levels, wave: Float32Array, nowMs: number): void {
@@ -227,6 +246,11 @@ export class GlWaterScene {
     this.time += deltaSec * (0.6 + levels.high * 1.4)
     this.moonDrift += deltaSec
     this.moonX = 0.5 + Math.sin(this.moonDrift * 0.04) * 0.07
+
+    // 球の格子は、静かなところでも止まらずに漂い、低域が来ると速く回る。
+    // 姿勢の作り方はシェーダー側（spinMatrix）が持っていて、ここは
+    // 「どれだけ回したか」だけを積み上げる
+    this.spin += deltaSec * (SPIN_IDLE + levels.low * SPIN_GAIN)
 
     this.ripples.prune(nowMs)
     this.packRipples(nowMs)
@@ -358,6 +382,7 @@ export class GlWaterScene {
       scene.setUniform('uHigh', this.levels.high)
       scene.setUniform('uHorizon', HORIZON_UV)
       scene.setUniform('uMotion', this.motion)
+      scene.setUniform('uSpin', this.spin)
       scene.setUniform('uEyeHeight', EYE_HEIGHT)
       scene.setUniform('uWave', this.waveRing)
       scene.setUniform('uRipples', this.rippleBuffer)
