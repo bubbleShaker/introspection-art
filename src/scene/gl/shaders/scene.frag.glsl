@@ -348,6 +348,66 @@ float fresnel(vec3 view, vec3 normal) {
   return 0.02 + 0.98 * pow(base, 5.0);
 }
 
+// ---- 球 --------------------------------------------------------------------
+//
+// 水面のすぐ上に浮かぶ球。音の波形はここに現れる（以前は画面へ後乗せした
+// 平らなリングだった）。水面と同じ世界に置いてあるので、月を映し、
+// フレネルで縁が光り、ブルームの前の段なので波頭が滲む。
+
+/** 目からの奥行き（-z 方向） */
+const float SPHERE_FORWARD = 3.6;
+
+/**
+ * 半径。
+ *
+ * 見かけの大きさ（uv 系）はおよそ 半径 / 奥行き になる。0.62 / 3.6 ≒ 0.17。
+ * これ以上大きくすると月に触れてしまい、水面の光の道ごと隠してしまう。
+ */
+const float SPHERE_RADIUS = 0.62;
+
+/** 水面からどれだけ浮いているか。真下に映り込みが入るだけの隙間を空ける */
+const float SPHERE_HOVER = 0.22;
+
+const vec3 SPHERE_CENTER = vec3(0.0, SPHERE_HOVER + SPHERE_RADIUS, -SPHERE_FORWARD);
+
+/** 球そのものの色。水と同じく、自分では光らず映すだけ */
+const vec3 SPHERE_BODY = vec3(0.008, 0.014, 0.034);
+
+/**
+ * レイと球の交差。手前の交点までの距離を返す。当たらなければ -1。
+ *
+ * rd は正規化済みなので、二次方程式の a が 1 になって式が短くなる。
+ * 内側からの交点（t < 0 の側）は使わない。球の中には入らない。
+ */
+float sphereHit(vec3 ro, vec3 rd) {
+  vec3 oc = ro - SPHERE_CENTER;
+  float b = dot(oc, rd);
+  float c = dot(oc, oc) - SPHERE_RADIUS * SPHERE_RADIUS;
+  float h = b * b - c;
+  if (h < 0.0) return -1.0;
+  float t = -b - sqrt(h);
+  return t > 0.0 ? t : -1.0;
+}
+
+/**
+ * 球に当たった視線の色。
+ *
+ * 水面と同じ組み立て方をしている。法線を求め、視線を反射させ、その方向の空を
+ * skyColor() で引き、フレネルで水そのものの色と混ぜる。同じ関数から色が来るので、
+ * 球と水面はひとりでに同じ夜を映す。
+ */
+vec3 sphereColor(vec3 ro, vec3 rd, float t) {
+  vec3 p = ro + rd * t;
+  vec3 normal = normalize(p - SPHERE_CENTER);
+
+  // 面が完全に滑らかだと、月がひとつの点に凝って刺さる。水面と同じく、
+  // 目に見えない細かさぶんだけ滲ませておく
+  float blur = 0.010;
+
+  vec3 reflected = reflect(rd, normal);
+  return mix(SPHERE_BODY, skyColor(reflected, blur), fresnel(-rd, normal));
+}
+
 // ---- 仕上げ ----------------------------------------------------------------
 //
 // ビネットとディザは、この後のブルームを重ねてからでないと意味がない。
@@ -359,13 +419,20 @@ void main() {
 
   // 視線。uv.y が uHorizon のところで水平になる
   vec3 rd = normalize(vec3(uv.x, uv.y - uHorizon, -1.0));
+  vec3 ro = vec3(0.0, uEyeHeight, 0.0);
   vec3 col;
 
-  if (rd.y >= 0.0) {
+  // 球は丸ごと水面より上にあるので、当たったならそれは必ず水面より手前。
+  // 距離を比べるまでもなく、球を先に見てよい
+  float tSphere = sphereHit(ro, rd);
+
+  if (tSphere > 0.0) {
+    col = sphereColor(ro, rd, tSphere);
+  } else if (rd.y >= 0.0) {
     col = skyColor(rd, 0.0);
   } else {
     float dist = min(uEyeHeight / -rd.y, MAX_DISTANCE);
-    vec3 hit = vec3(0.0, uEyeHeight, 0.0) + rd * dist;
+    vec3 hit = ro + rd * dist;
 
     float blur;
     vec3 normal = waterSurface(hit.xz, dist, blur);
