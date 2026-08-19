@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import sceneSource from '../src/scene/gl/shaders/scene.frag.glsl?raw'
-import { packWaveRing, WAVE_RING_POINTS, WAVE_SLOTS } from '../src/scene/waveSphere.ts'
+import { packWaveRing, waveAt, WAVE_RING_POINTS } from '../src/scene/waveSphere.ts'
 
 function ring(): Float32Array {
   return new Float32Array(WAVE_RING_POINTS)
@@ -15,20 +14,50 @@ function steps(values: Float32Array): number[] {
   return out
 }
 
-describe('シェーダーとの取り決め', () => {
-  /**
-   * 輪の点の数は、JS とシェーダーの二か所に書いてある。ずれても例外は飛ばない
-   * （短ければ余った vec4 が前フレームの値のまま残り、長ければ黙って捨てられる）。
-   * 黙って壊れるものは、テストで留めておく。
-   */
-  it('輪の点の数が、シェーダーの WAVE_POINTS と一致する', () => {
-    const found = /const int WAVE_POINTS = (\d+);/.exec(sceneSource)
-    expect(found).not.toBeNull()
-    expect(Number(found?.[1])).toBe(WAVE_RING_POINTS)
+describe('waveAt', () => {
+  /** 経度 lon（0..1）の向きを、単位ベクトルの xz にする */
+  function at(values: Float32Array, lon: number, y = 0): number {
+    const angle = (lon - 0.5) * Math.PI * 2
+    const around = Math.sqrt(1 - y * y)
+    return waveAt(values, Math.cos(angle) * around, Math.sin(angle) * around)
+  }
+
+  it('その向きの値を引く', () => {
+    const values = new Float32Array(WAVE_RING_POINTS)
+    values[64] = 1
+    // 輪の 64 番目は経度 0.5、つまり +x の向き
+    expect(at(values, 64 / WAVE_RING_POINTS)).toBeCloseTo(1, 5)
+    expect(at(values, 0)).toBeCloseTo(0, 5)
   })
 
-  it('vec4 の本数だけ 4 点ずつ詰めて、輪をちょうど埋め切る', () => {
-    expect(WAVE_SLOTS * 4).toBe(WAVE_RING_POINTS)
+  it('極では、どの向きでも 0 になる', () => {
+    const values = new Float32Array(WAVE_RING_POINTS).fill(1)
+    // 極は経度が定まらない。細めないと、輪の全部の値がここでぶつかる
+    expect(waveAt(values, 0, 0)).toBe(0)
+    expect(at(values, 0.3, 1)).toBeCloseTo(0, 5)
+  })
+
+  it('隣り合う点のあいだで段にならない', () => {
+    const values = Float32Array.from({ length: WAVE_RING_POINTS }, (_, i) =>
+      Math.sin((i / WAVE_RING_POINTS) * Math.PI * 2),
+    )
+
+    // 一周を、輪の点よりずっと細かく歩く
+    const steps = 400
+    let previous = at(values, 0)
+    for (let i = 1; i <= steps; i++) {
+      const value = at(values, i / steps)
+      // 滑らかに繋いでいれば、1 歩の差は 2π / 400 ≒ 0.016 のあたりに収まる。
+      // 繋がずに最寄りの点を拾うと、輪の点の上で 2π / 128 ≒ 0.049 の段になる
+      expect(Math.abs(value - previous)).toBeLessThan(0.03)
+      previous = value
+    }
+  })
+
+  it('輪が 1 を越えて届いても、-1..1 に収まる', () => {
+    const values = new Float32Array(WAVE_RING_POINTS).fill(1.07)
+    expect(at(values, 0.25)).toBeLessThanOrEqual(1)
+    expect(at(values.map((v) => -v), 0.25)).toBeGreaterThanOrEqual(-1)
   })
 })
 
