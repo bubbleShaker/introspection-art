@@ -2,31 +2,23 @@
  * 波形を、球のまわりを一周する輪に畳む。
  *
  * p5 も WebGL も知らない純粋な計算にしてある。ここが「どの向きがどれだけ
- * 強いか」の唯一の出どころで、シェーダーは出来た輪を引くだけ。
+ * 強いか」の唯一の出どころで、dotSphere.ts は出来た輪を引くだけ。
  * ripples.ts と同じ扱い。
  *
- * 輪の値の行き先は、球の形ではなく**格子の線の濃さ**である（形を歪めていた
- * 頃は輪郭がヨレて見えた）。強い向きの線がその場で明るくなる。
+ * 輪の値は、球に並べた点の**半径**になる。強い向きの点が外へ出て、そこだけ
+ * 球がうねる。
  *
  * 以前は同じ役目を waveRing.ts が持っていて、画面上の点列（x, y）を返していた。
- * 球にしたことで、必要なのは「向き → 強さ」だけになり、線の位置は
- * シェーダー側が交差判定から出す。
+ * 球にしたことで、必要なのは「向き → 強さ」だけになった。
  */
-
-/** シェーダーへ渡す時の vec4 の本数。scene.frag.glsl の uWave[WAVE_POINTS / 4] と揃える */
-export const WAVE_SLOTS = 32
 
 /**
  * 輪をひと巡りするのに使う点の数。
  *
- * vec4 に 4 つずつ詰めるので、4 の倍数でなければならない。128 あれば、
- * 球の赤道をぐるりと回っても隣り合う点の段差が見えない。
- *
- * **scene.frag.glsl の WAVE_POINTS と必ず揃える**。ずれても例外は飛ばず、
- * 短ければ余った vec4 が前フレームの値のまま残り、長ければ黙って捨てられる。
- * tests/waveSphere.test.ts が、シェーダーの原文を読んで一致を確かめている。
+ * 128 あれば、球の赤道をぐるりと回っても隣り合う点の段差が見えない
+ * （球に並ぶ点は、いちばん多い行でも 44 個ほどしかない）。
  */
-export const WAVE_RING_POINTS = WAVE_SLOTS * 4
+export const WAVE_RING_POINTS = 128
 
 /**
  * 波形にかける利得。
@@ -75,6 +67,44 @@ export function packWaveRing(wave: Float32Array, timeSec: number, out: Float32Ar
     // 3 周期ぶんにしているので、一周してちょうど元に戻る（ここでも継ぎ目が出ない）
     out[i] = value + Math.sin(angle * 3 + timeSec * BREATH_SPEED) * BREATH
   }
+}
+
+/**
+ * 輪から、その向きの値を読む。-1..1。
+ *
+ * 縦軸まわりの角度（経度）だけで引くので、要るのは x と z である。高さ（y）は
+ * 「極へ近づくほど細める」ためだけに効き、その細さは xz の長さがそのまま表す。
+ *
+ * 細めるのは、極では経度が定まらないため。細めないと、極の一点で輪の全部の値が
+ * ぶつかって、そこだけがちらつく。
+ *
+ * 隣り合う 2 点を 3t²-2t³ で混ぜているのは、値が 128 か所で段になるのを避けるため。
+ *
+ * @param ring packWaveRing が書いた輪。`WAVE_RING_POINTS` の長さが要る
+ *   （短いと配列の外を読んで NaN が出る。packWaveRing は長さ不足を守るが、
+ *   こちらは毎フレーム点の数だけ呼ばれるので、確かめずに読む）
+ * @param x 単位ベクトルの x
+ * @param z 単位ベクトルの z
+ */
+export function waveAt(ring: Float32Array, x: number, z: number): number {
+  // 極では経度が定まらない。atan2(0, 0) は 0 を返すが、そこは輪の全部の値が
+  // 集まる特異点なので、値を引かずに 0 で抜ける
+  const around = Math.hypot(x, z)
+  if (around < 1e-6) return 0
+
+  const lon = Math.atan2(z, x) / (Math.PI * 2) + 0.5
+  const pos = lon * WAVE_RING_POINTS
+
+  const i0 = Math.floor(pos) % WAVE_RING_POINTS
+  const i1 = (i0 + 1) % WAVE_RING_POINTS
+  const f = pos - Math.floor(pos)
+
+  const smooth = f * f * (3 - 2 * f)
+  const value = ring[i0] + (ring[i1] - ring[i0]) * smooth
+  // -1..1 に収める。packWaveRing は tanh に息づかいを足すので、わずかに 1 を超える
+  const clamped = Math.max(-1, Math.min(1, value))
+  // 極からの遠さ。赤道で 1、真上と真下で 0
+  return clamped * around
 }
 
 /**

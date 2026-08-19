@@ -1,8 +1,17 @@
 import p5 from 'p5'
 import type { Levels } from '../../core/levels.ts'
+import { EYE_HEIGHT, HORIZON_UV, moonDirection, waterPointAt } from '../camera.ts'
+import {
+  buildDotDirections,
+  DOT_BACK,
+  DOT_FRONT,
+  DOT_STRIDE,
+  dotCount,
+  projectDots,
+  spinMatrix,
+} from '../dotSphere.ts'
 import { opacityRatio, progress, radiusRatio, RippleField } from '../ripples.ts'
 import { packWaveRing, WAVE_RING_POINTS } from '../waveSphere.ts'
-import { EYE_HEIGHT, HORIZON_UV, moonDirection, waterPointAt } from './camera.ts'
 import { QualityGovernor } from './quality.ts'
 import bloomSource from './shaders/bloom.frag.glsl?raw'
 import compositeSource from './shaders/composite.frag.glsl?raw'
@@ -38,12 +47,11 @@ const BLOOM_DOWNSCALE = 2
 const BLOOM_RADIUS = 26
 
 /**
- * 球の格子が、無音でも回り続ける速さ（秒あたり）。
+ * 球が、無音でも回り続ける速さ（秒あたり）。
  *
- * 回し切っているのは視線の軸まわりだけで、その角度はシェーダー側
- * （scene.frag.glsl の spinMatrix）で `uSpin * 0.30` になる。無音では
- * ひと回りに 2π / (0.5 * 0.30) ≒ 42 秒。曲の静けさに対して、これ以上速いと
- * 落ち着かない。
+ * 回し切っているのは視線の軸まわりだけで、その角度は dotSphere.ts の
+ * spinMatrix で `t * 0.3` になる。無音ではひと回りに 2π / (0.5 * 0.3) ≒ 42 秒。
+ * 曲の静けさに対して、これ以上速いと落ち着かない。
  *
  * この 42 秒は**二つのファイルに跨がって**決まる。片方だけ動かしても例外は
  * 出ないので、tests/spinPeriod.test.ts が突き合わせている。
@@ -52,6 +60,31 @@ const SPIN_IDLE = 0.5
 
 /** 低域がいっぱいの時に、この量だけ上乗せされる */
 const SPIN_GAIN = 1.1
+
+/**
+ * 点の白さ。0..1。
+ *
+ * 点はシェーダーの後から重ねるので、あちらの最後にある明るさの圧縮
+ * （col / (1 + col)）を通らない。線だった頃の 0.95 をそのまま置くと、
+ * 圧縮を受けた背景に対して明るすぎ、ブルームにも拾われて煙に見える。
+ * ここには**圧縮を通した後の値**を置いてある（0.95 / 1.95 ≒ 0.487）。
+ *
+ * ブルームの閾値（bloom.frag の THRESHOLD）との関係は
+ * tests/dotBrightness.test.ts が突き合わせている。
+ */
+const DOT_LUMA = 0.487
+
+/**
+ * 濃さを何段に分けて打つか。
+ *
+ * 点の**大きさ**（strokeWeight）は、p5 では uniform で渡るので、ひと続きの
+ * 図形の中で頂点ごとには変えられない。奥の点を小さく薄くするには、近いものを
+ * まとめて打つしかないので、段に切って段ごとに 1 回ずつ描く。
+ *
+ * 濃さと大きさは連れ立って動く（奥の点ほど薄く、そして小さい）ので、段は
+ * 濃さで切れば足りる。5 段あれば、点が小さいこともあって境目は見えない。
+ */
+const DOT_LAYERS = 5
 
 /**
  * この端末で描けるか。
@@ -111,12 +144,26 @@ export class GlWaterScene {
   private readonly levels: Levels = { low: 0, mid: 0, high: 0 }
 
   /**
-   * 球のまわりを一周する波形。シェーダーへ渡す形に畳んだもの。
+   * 球のまわりを一周する波形。輪に畳んだもの（読むのは dotSphere.ts）。
    *
    * levels と同じで、渡された配列は持たずに値を写す。向こうは毎フレーム同じ
    * 配列を書き換えて使い回しているので、参照で持つと「いつ読むか」に絵が左右される。
    */
   private readonly waveRing = new Float32Array(WAVE_RING_POINTS)
+
+  /**
+   * 球に並べた点の向き。
+   *
+   * 向きは動かない（うねるのは半径の方）ので、組み立ての一度きりで足りる。
+   * **宣言の順に初期化される**ので、下の入れ物より先に置いてある。
+   */
+  private readonly dotDirections = buildDotDirections()
+
+  /** 画面へ落とした点。[x, y, 大きさ, 濃さ] の並び。毎フレーム詰め替える */
+  private readonly dots = new Float32Array(dotCount(this.dotDirections) * DOT_STRIDE)
+
+  /** 球の姿勢（3×3, 行優先）。毎フレーム書き換える */
+  private readonly spinBasis = new Float32Array(9)
 
   private readonly ripples = new RippleField()
   /** 波紋をシェーダーへ渡すための入れ物。毎フレーム作り直さず、詰め替える */
@@ -143,7 +190,7 @@ export class GlWaterScene {
   /** 月が漂った量（秒）。時刻に係数を掛けないのは上と同じ理由 */
   private moonDrift = 0
 
-  /** 球の格子が回った量（秒）。時刻に係数を掛けないのは上と同じ理由 */
+  /** 球が回った量（秒）。時刻に係数を掛けないのは上と同じ理由 */
   private spin = 0
 
   constructor(
@@ -230,7 +277,7 @@ export class GlWaterScene {
    * 1 フレーム描く。
    *
    * @param levels 帯域ごとの強さ（水面と空が読む）
-   * @param wave 時間領域の波形 -1..1（球の格子の、線の濃さが読む）
+   * @param wave 時間領域の波形 -1..1（球に並んだ点の、半径が読む）
    * @param nowMs 今の時刻
    */
   draw(levels: Levels, wave: Float32Array, nowMs: number): void {
@@ -247,8 +294,8 @@ export class GlWaterScene {
     this.moonDrift += deltaSec
     this.moonX = 0.5 + Math.sin(this.moonDrift * 0.04) * 0.07
 
-    // 球の格子は、静かなところでも止まらずに漂い、低域が来ると速く回る。
-    // 姿勢の作り方はシェーダー側（spinMatrix）が持っていて、ここは
+    // 球は、静かなところでも止まらずに漂い、低域が来ると速く回る。
+    // 姿勢の作り方は dotSphere.ts（spinMatrix）が持っていて、ここは
     // 「どれだけ回したか」だけを積み上げる
     this.spin += deltaSec * (SPIN_IDLE + levels.low * SPIN_GAIN)
 
@@ -382,15 +429,17 @@ export class GlWaterScene {
       scene.setUniform('uHigh', this.levels.high)
       scene.setUniform('uHorizon', HORIZON_UV)
       scene.setUniform('uMotion', this.motion)
-      scene.setUniform('uSpin', this.spin)
       scene.setUniform('uEyeHeight', EYE_HEIGHT)
-      scene.setUniform('uWave', this.waveRing)
       scene.setUniform('uRipples', this.rippleBuffer)
       scene.setUniform('uRippleCount', this.rippleCount)
       scene.setUniform('uMoonDir', moonDirection(this.moonX, this.aspect()))
       // ここだけ板をわずかに広げる。この段は gl_FragCoord から座標を作るので
       // はみ出しても絵はずれず、丸め誤差で端に隙間ができるのだけを防げる
       sketch.plane(sceneBuffer.width * 1.02, sceneBuffer.height * 1.02)
+      // 点は、出来上がった海と空のうえへ重ねる。ここで打っておけば、
+      // このあとの仕上げ（ビネット・ディザ）が点にも同じように掛かる。
+      // 滲みの方は、明るさが閾値の下にあるので拾われない（DOT_LUMA）
+      this.drawDots(sketch)
       sceneBuffer.end()
 
       bloomBuffer.begin()
@@ -413,6 +462,82 @@ export class GlWaterScene {
       return
     }
 
+  }
+
+  /**
+   * 点の球を、今の絵のうえへ打つ。
+   *
+   * 点の位置と大きさと濃さは dotSphere.ts が出している。ここがするのは
+   * 「出た数を p5 の頂点にすること」だけ。
+   *
+   * 濃さの段ごとに分けて打つ。点の大きさ（strokeWeight）は p5 では uniform で
+   * 渡るので、ひと続きの図形の中で頂点ごとには変えられない。
+   * **奥の段から先に打つ**。深度を持たない面へ描いているので、重なりは
+   * 描いた順にそのまま出る。
+   */
+  private drawDots(sketch: p5): void {
+    spinMatrix(this.spin, this.spinBasis)
+    const count = projectDots(
+      this.dotDirections,
+      this.waveRing,
+      this.levels.low,
+      this.spinBasis,
+      sketch.height,
+      this.dots,
+    )
+
+    // シーンのシェーダーが張られたままだと、頂点もそちらで塗られてしまう
+    sketch.resetShader()
+
+    // **面へ描くあいだ、p5 の y は上下が逆になる**（テクスチャの向きに合わせて
+    // 面の側が軸を裏返している）。ここで裏返し返して、画面へ直に描いた時と
+    // 同じ座標で打てるようにする。忘れると、球だけが水平線を挟んで反対側へ回る。
+    //
+    // 色と線の太さも push で囲っておく。**塗り（fill）と線（stroke）の設定は、
+    // この後の段まで生き残ると絵が消える**（板を張る段は塗りで描いているので、
+    // noFill が残ると滲みも仕上げも出ない）。p5 の面は begin/end で内部的に
+    // push/pop するので今でも巻き戻るが、それに頼らずここで閉じる
+    sketch.push()
+    sketch.noFill()
+    sketch.scale(1, -1)
+
+    const white = DOT_LUMA * 255
+
+    for (let layer = 0; layer < DOT_LAYERS; layer++) {
+      // その段の濃さの範囲。段の中は代表値ひとつで塗る。
+      // 濃さは DOT_BACK..DOT_FRONT の間にしか来ないので、そこを等分する
+      // （0..1 を等分すると、下の方の段が常に空振りして刻みが粗くなる）。
+      // いちばん上の段だけ閉じない（濃さが DOT_FRONT ちょうどの点を落とさないため）
+      const band = (DOT_FRONT - DOT_BACK) / DOT_LAYERS
+      const low = DOT_BACK + layer * band
+      const high = layer + 1 === DOT_LAYERS ? Number.POSITIVE_INFINITY : low + band
+
+      // 段の中の平均を代表にする。大きさも一緒に均すのは、奥行きと濃さが
+      // 連れ立って動く（奥の点ほど薄く、そして小さい）ため
+      let weight = 0
+      let shade = 0
+      let members = 0
+      for (let i = 0; i < count; i++) {
+        const alpha = this.dots[i * DOT_STRIDE + 3]
+        if (alpha < low || alpha >= high) continue
+        weight += this.dots[i * DOT_STRIDE + 2]
+        shade += alpha
+        members++
+      }
+      if (members === 0) continue
+
+      sketch.stroke(white, white, white, (shade / members) * 255)
+      sketch.strokeWeight(weight / members)
+      sketch.beginShape(sketch.POINTS)
+      for (let i = 0; i < count; i++) {
+        const alpha = this.dots[i * DOT_STRIDE + 3]
+        if (alpha < low || alpha >= high) continue
+        sketch.vertex(this.dots[i * DOT_STRIDE], this.dots[i * DOT_STRIDE + 1])
+      }
+      sketch.endShape()
+    }
+
+    sketch.pop()
   }
 
   /** 画面の横 / 縦 */

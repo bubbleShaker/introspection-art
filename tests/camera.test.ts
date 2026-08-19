@@ -5,7 +5,7 @@ import {
   MOON_UV_Y,
   moonDirection,
   waterPointAt,
-} from '../src/scene/gl/camera.ts'
+} from '../src/scene/camera.ts'
 
 /**
  * シェーダーが視線を組み立てている式を、こちら側からもう一度解く。
